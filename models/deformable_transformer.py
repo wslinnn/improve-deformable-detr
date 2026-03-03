@@ -32,6 +32,7 @@ class DeformableTransformer(nn.Module):
         self.nhead = nhead
         self.two_stage = two_stage
         self.two_stage_num_proposals = two_stage_num_proposals
+        self.num_feature_levels = num_feature_levels
 
         # 非对称采样：Encoder 处理 4 层（C3-C6），Decoder 处理 5 层（C2-C6）
         # Encoder 使用固定的 n_levels=4
@@ -69,6 +70,14 @@ class DeformableTransformer(nn.Module):
             xavier_uniform_(self.reference_points.weight.data, gain=1.0)
             constant_(self.reference_points.bias.data, 0.)
         normal_(self.level_embed)
+
+        # 非对称采样：让C2和C3的level_embed初始值保持一致
+        # 注意：此时level_embed都是随机初始化的，不是预训练权重
+        # 真正有效的预训练权重迁移在 main.py 加载 checkpoint 后执行
+        # 这里只是为了保证C2和C3的初始状态同步，避免训练初期的不稳定
+        if self.num_feature_levels == 5:  # 确保是5层模式
+            with torch.no_grad():
+                self.level_embed[4].copy_(self.level_embed[0])
 
     def get_proposal_pos_embed(self, proposals):
         num_pos_feats = 128
