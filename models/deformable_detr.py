@@ -258,7 +258,7 @@ class SetCriterion(nn.Module):
         return losses
 
     def loss_boxes(self, outputs, targets, indices, num_boxes):
-        """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
+        """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU/CIoU loss
            targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
            The target boxes are expected in format (center_x, center_y, h, w), normalized by the image size.
         """
@@ -272,10 +272,20 @@ class SetCriterion(nn.Module):
         losses = {}
         losses['loss_bbox'] = loss_bbox.sum() / num_boxes
 
+        # ========== GIoU Loss (原始版本) ==========
         loss_giou = 1 - torch.diag(box_ops.generalized_box_iou(
             box_ops.box_cxcywh_to_xyxy(src_boxes),
             box_ops.box_cxcywh_to_xyxy(target_boxes)))
         losses['loss_giou'] = loss_giou.sum() / num_boxes
+
+        # ========== CIoU Loss (改进版本) ==========
+        # CIoU = IoU - (center_distance / diagonal_length) - aspect_ratio_consistency
+        # 参考: https://arxiv.org/abs/1911.08287
+        # 优势: 考虑中心点距离和宽高比，收敛更快，定位更精确
+        # loss_ciou = 1 - torch.diag(box_ops.complete_box_iou(
+        #     box_ops.box_cxcywh_to_xyxy(src_boxes),
+        #     box_ops.box_cxcywh_to_xyxy(target_boxes)))
+        # losses['loss_giou'] = loss_ciou.sum() / num_boxes  # 保持 key 不变以兼容训练日志
         return losses
 
     def loss_masks(self, outputs, targets, indices, num_boxes):
