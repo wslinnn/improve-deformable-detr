@@ -62,8 +62,9 @@ def get_args_parser():
     parser.add_argument('--position_embedding_scale', default=2 * np.pi, type=float,
                         help="position / size * scale")
     parser.add_argument('--num_feature_levels', default=5, type=int, help='number of feature levels')
-    # 原始默认值: default=4 (对应 C3, C4, C5 + 1层下采样)
-    # 新默认值: default=5 (对应 C2, C3, C4, C5 + 1层下采样 C6)
+    # 原始默认值: default=4 (对应 C3, C4, C5 + 1层下采样 C6)
+    # 新默认值: default=5 (对应 C3, C4, C5, C6, C2) - 非对称采样
+    # 注意：C2 在最后是为了保持与预训练权重的兼容性（level_embed[0:4] 对应 C3-C6）
 
     # * Transformer
     parser.add_argument('--enc_layers', default=6, type=int,
