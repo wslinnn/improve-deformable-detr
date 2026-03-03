@@ -72,10 +72,15 @@ class BackboneBase(nn.Module):
             if not train_backbone or 'layer2' not in name and 'layer3' not in name and 'layer4' not in name:
                 parameter.requires_grad_(False)
         if return_interm_layers:
-            # return_layers = {"layer1": "0", "layer2": "1", "layer3": "2", "layer4": "3"}
-            return_layers = {"layer2": "0", "layer3": "1", "layer4": "2"}
-            self.strides = [8, 16, 32]
-            self.num_channels = [512, 1024, 2048]
+            # 原始代码（3层特征 C3, C4, C5）:
+            # return_layers = {"layer2": "0", "layer3": "1", "layer4": "2"}
+            # self.strides = [8, 16, 32]
+            # self.num_channels = [512, 1024, 2048]
+
+            # 新代码（4层特征 C2, C3, C4, C5）用于 5 层特征层级:
+            return_layers = {"layer1": "0", "layer2": "1", "layer3": "2", "layer4": "3"}
+            self.strides = [4, 8, 16, 32]
+            self.num_channels = [256, 512, 1024, 2048]
         else:
             return_layers = {'layer4': "0"}
             self.strides = [32]
