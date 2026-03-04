@@ -67,7 +67,7 @@ def get_args_parser():
     # 注意：C2 在最后是为了保持与预训练权重的兼容性（level_embed[0:4] 对应 C3-C6）
 
     # * Transformer
-    parser.add_argument('--enc_layers', default=6, type=int,
+    parser.add_argument('--enc_layers', default=4, type=int,
                         help="Number of encoding layers in the transformer")
     parser.add_argument('--dec_layers', default=6, type=int,
                         help="Number of decoding layers in the transformer")
@@ -81,7 +81,7 @@ def get_args_parser():
                         help="Number of attention heads inside the transformer's attentions")
     parser.add_argument('--num_queries', default=300, type=int,
                         help="Number of query slots")
-    parser.add_argument('--dec_n_points', default=4, type=int)
+    parser.add_argument('--dec_n_points', default=8, type=int)
     parser.add_argument('--enc_n_points', default=4, type=int)
 
     # * Segmentation
@@ -116,7 +116,7 @@ def get_args_parser():
     parser.add_argument('--num_classes', default=7, type=int,
                         help='Number of object classes (default: auto-detect from dataset)')
 
-    parser.add_argument('--output_dir', default='/root/autodl-tmp/logs/deformable_detr-100-twostage-2',
+    parser.add_argument('--output_dir', default='/root/autodl-tmp/logs/deformable_detr-100-twostage-final',
                         help='path where to save, empty for no saving')
     parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
@@ -126,7 +126,7 @@ def get_args_parser():
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
                         help='start epoch')
     parser.add_argument('--eval', action='store_true')
-    parser.add_argument('--num_workers', default=2, type=int)
+    parser.add_argument('--num_workers', default=4, type=int)
     parser.add_argument('--cache_mode', default=True, action='store_true', help='whether to cache images on memory')
 
     return parser
