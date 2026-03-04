@@ -452,9 +452,15 @@ class MLP(nn.Module):
 
 
 def build(args):
-    num_classes = 20 if args.dataset_file != 'coco' else 91
-    if args.dataset_file == "coco_panoptic":
+    # 优先使用用户指定的num_classes参数，否则使用默认值
+    if args.num_classes is not None:
+        num_classes = args.num_classes
+    elif args.dataset_file == "coco_panoptic":
         num_classes = 250
+    elif args.dataset_file == 'coco':
+        num_classes = 91
+    else:
+        num_classes = 20
     device = torch.device(args.device)
 
     backbone = build_backbone(args)
