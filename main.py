@@ -273,59 +273,59 @@ def main(args):
                 model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir
             )
 
-    # ========== 非对称采样权重迁移 ==========
-    # 在加载预训练权重后，用C3的权重初始化C2
-    print('\n=== Asymmetric Sampling Weight Transfer ===')
-
-    # 1. level_embed: 用C3初始化C2
-    if hasattr(model_without_ddp, 'transformer') and hasattr(model_without_ddp.transformer, 'level_embed'):
-        if model_without_ddp.transformer.level_embed.shape[0] == 5:
-            with torch.no_grad():
-                model_without_ddp.transformer.level_embed[4].copy_(model_without_ddp.transformer.level_embed[0])
-            print('✓ Initialized C2 level_embed with C3 pretrained weights')
-
-    # 2. input_proj: 用C3的前256通道初始化C2
-    if hasattr(model_without_ddp, 'input_proj') and len(model_without_ddp.input_proj) >= 2:
-        with torch.no_grad():
-            w_c3 = model_without_ddp.input_proj[1][0].weight  # [256, 512, 1, 1]
-            b_c3 = model_without_ddp.input_proj[1][0].bias  # [256]
-            model_without_ddp.input_proj[0][0].weight.copy_(w_c3[:, :256, :, :])
-            model_without_ddp.input_proj[0][0].bias.copy_(b_c3)
-            # 同样初始化 GroupNorm 的 weight 和 bias
-            if hasattr(model_without_ddp.input_proj[0][0], 'weight'):
-                # input_proj 是 nn.Sequential，第二个是 GroupNorm
-                gn_c3_weight = model_without_ddp.input_proj[1][1].weight
-                gn_c3_bias = model_without_ddp.input_proj[1][1].bias
-                model_without_ddp.input_proj[0][1].weight.copy_(gn_c3_weight)
-                model_without_ddp.input_proj[0][1].bias.copy_(gn_c3_bias)
-            print('✓ Initialized C2 input_proj with C3 pretrained weights (first 256 channels)')
-
-    # 3. 验证 Backbone C2 权重是否加载
-    if hasattr(model_without_ddp, 'backbone'):
-        # 检查 ResNet layer1 的权重
-        layer1_weight = None
-        for name, param in model_without_ddp.named_parameters():
-            if 'layer1' in name and 'conv1' in name and 'weight' in name:
-                layer1_weight = param
-                break
-        if layer1_weight is not None:
-            weight_sum = layer1_weight.sum().item()
-            if abs(weight_sum) > 1e-6:  # 不是全零
-                print(f'✓ Backbone C2 (layer1) weights loaded (sum={weight_sum:.4f})')
-            else:
-                print('⚠ Backbone C2 (layer1) weights appear to be zero!')
-        else:
-            print('⚠ Could not verify Backbone C2 weights')
-
-    print('=== Weight Transfer Complete ===\n')
-
-    # 非对称采样：用加载后的C3 level_embed初始化C2
-    # 必须在load_state_dict之后执行，因为此时C3的level_embed才有预训练权重
-    if hasattr(model_without_ddp, 'transformer') and hasattr(model_without_ddp.transformer, 'level_embed'):
-        if model_without_ddp.transformer.level_embed.shape[0] == 5:
-            with torch.no_grad():
-                model_without_ddp.transformer.level_embed[4].copy_(model_without_ddp.transformer.level_embed[0])
-            print('Initialized C2 level_embed with C3 pretrained weights')
+    # # ========== 非对称采样权重迁移 ==========
+    # # 在加载预训练权重后，用C3的权重初始化C2
+    # print('\n=== Asymmetric Sampling Weight Transfer ===')
+    #
+    # # 1. level_embed: 用C3初始化C2
+    # if hasattr(model_without_ddp, 'transformer') and hasattr(model_without_ddp.transformer, 'level_embed'):
+    #     if model_without_ddp.transformer.level_embed.shape[0] == 5:
+    #         with torch.no_grad():
+    #             model_without_ddp.transformer.level_embed[4].copy_(model_without_ddp.transformer.level_embed[0])
+    #         print('✓ Initialized C2 level_embed with C3 pretrained weights')
+    #
+    # # 2. input_proj: 用C3的前256通道初始化C2
+    # if hasattr(model_without_ddp, 'input_proj') and len(model_without_ddp.input_proj) >= 2:
+    #     with torch.no_grad():
+    #         w_c3 = model_without_ddp.input_proj[1][0].weight  # [256, 512, 1, 1]
+    #         b_c3 = model_without_ddp.input_proj[1][0].bias  # [256]
+    #         model_without_ddp.input_proj[0][0].weight.copy_(w_c3[:, :256, :, :])
+    #         model_without_ddp.input_proj[0][0].bias.copy_(b_c3)
+    #         # 同样初始化 GroupNorm 的 weight 和 bias
+    #         if hasattr(model_without_ddp.input_proj[0][0], 'weight'):
+    #             # input_proj 是 nn.Sequential，第二个是 GroupNorm
+    #             gn_c3_weight = model_without_ddp.input_proj[1][1].weight
+    #             gn_c3_bias = model_without_ddp.input_proj[1][1].bias
+    #             model_without_ddp.input_proj[0][1].weight.copy_(gn_c3_weight)
+    #             model_without_ddp.input_proj[0][1].bias.copy_(gn_c3_bias)
+    #         print('✓ Initialized C2 input_proj with C3 pretrained weights (first 256 channels)')
+    #
+    # # 3. 验证 Backbone C2 权重是否加载
+    # if hasattr(model_without_ddp, 'backbone'):
+    #     # 检查 ResNet layer1 的权重
+    #     layer1_weight = None
+    #     for name, param in model_without_ddp.named_parameters():
+    #         if 'layer1' in name and 'conv1' in name and 'weight' in name:
+    #             layer1_weight = param
+    #             break
+    #     if layer1_weight is not None:
+    #         weight_sum = layer1_weight.sum().item()
+    #         if abs(weight_sum) > 1e-6:  # 不是全零
+    #             print(f'✓ Backbone C2 (layer1) weights loaded (sum={weight_sum:.4f})')
+    #         else:
+    #             print('⚠ Backbone C2 (layer1) weights appear to be zero!')
+    #     else:
+    #         print('⚠ Could not verify Backbone C2 weights')
+    #
+    # print('=== Weight Transfer Complete ===\n')
+    #
+    # # 非对称采样：用加载后的C3 level_embed初始化C2
+    # # 必须在load_state_dict之后执行，因为此时C3的level_embed才有预训练权重
+    # if hasattr(model_without_ddp, 'transformer') and hasattr(model_without_ddp.transformer, 'level_embed'):
+    #     if model_without_ddp.transformer.level_embed.shape[0] == 5:
+    #         with torch.no_grad():
+    #             model_without_ddp.transformer.level_embed[4].copy_(model_without_ddp.transformer.level_embed[0])
+    #         print('Initialized C2 level_embed with C3 pretrained weights')
 
     if args.eval:
         test_stats, coco_evaluator = evaluate(model, criterion, postprocessors,
