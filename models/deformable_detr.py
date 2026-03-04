@@ -273,19 +273,19 @@ class SetCriterion(nn.Module):
         losses['loss_bbox'] = loss_bbox.sum() / num_boxes
 
         # ========== GIoU Loss (原始版本) ==========
-        loss_giou = 1 - torch.diag(box_ops.generalized_box_iou(
-            box_ops.box_cxcywh_to_xyxy(src_boxes),
-            box_ops.box_cxcywh_to_xyxy(target_boxes)))
-        losses['loss_giou'] = loss_giou.sum() / num_boxes
+        # loss_giou = 1 - torch.diag(box_ops.generalized_box_iou(
+        #     box_ops.box_cxcywh_to_xyxy(src_boxes),
+        #     box_ops.box_cxcywh_to_xyxy(target_boxes)))
+        # losses['loss_giou'] = loss_giou.sum() / num_boxes
 
         # ========== CIoU Loss (改进版本) ==========
         # CIoU = IoU - (center_distance / diagonal_length) - aspect_ratio_consistency
         # 参考: https://arxiv.org/abs/1911.08287
         # 优势: 考虑中心点距离和宽高比，收敛更快，定位更精确
-        # loss_ciou = 1 - torch.diag(box_ops.complete_box_iou(
-        #     box_ops.box_cxcywh_to_xyxy(src_boxes),
-        #     box_ops.box_cxcywh_to_xyxy(target_boxes)))
-        # losses['loss_giou'] = loss_ciou.sum() / num_boxes  # 保持 key 不变以兼容训练日志
+        loss_ciou = 1 - torch.diag(box_ops.complete_box_iou(
+            box_ops.box_cxcywh_to_xyxy(src_boxes),
+            box_ops.box_cxcywh_to_xyxy(target_boxes)))
+        losses['loss_giou'] = loss_ciou.sum() / num_boxes  # 保持 key 不变以兼容训练日志
         return losses
 
     def loss_masks(self, outputs, targets, indices, num_boxes):
