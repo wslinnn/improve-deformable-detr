@@ -28,16 +28,16 @@ from models import build_model
 
 def get_args_parser():
     parser = argparse.ArgumentParser('Deformable DETR Detector', add_help=False)
-    parser.add_argument('--lr', default=2e-4, type=float)
+    parser.add_argument('--lr', default=1e-4, type=float)
     parser.add_argument('--lr_backbone_names', default=["backbone.0"], type=str, nargs='+')
-    parser.add_argument('--lr_backbone', default=2e-5, type=float)
+    parser.add_argument('--lr_backbone', default=1e-5, type=float)
     parser.add_argument('--lr_linear_proj_names', default=['reference_points', 'sampling_offsets'], type=str, nargs='+')
     parser.add_argument('--lr_linear_proj_mult', default=0.1, type=float)
     parser.add_argument('--batch_size', default=2, type=int)
     parser.add_argument('--weight_decay', default=1e-4, type=float)
-    parser.add_argument('--epochs', default=50, type=int)
-    parser.add_argument('--lr_drop', default=40, type=int)
-    parser.add_argument('--lr_drop_epochs', default=None, type=int, nargs='+')
+    parser.add_argument('--epochs', default=100, type=int)
+    parser.add_argument('--lr_drop', default=50, type=int)
+    parser.add_argument('--lr_drop_epochs', type=int, nargs='+')
     parser.add_argument('--clip_max_norm', default=0.1, type=float,
                         help='gradient clipping max norm')
 
@@ -45,8 +45,8 @@ def get_args_parser():
     parser.add_argument('--sgd', action='store_true')
 
     # Variants of Deformable DETR
-    parser.add_argument('--with_box_refine', default=False, action='store_true')
-    parser.add_argument('--two_stage', default=False, action='store_true')
+    parser.add_argument('--with_box_refine', default=True, action='store_true')
+    parser.add_argument('--two_stage', default=True, action='store_true')
 
     # Model parameters
     parser.add_argument('--frozen_weights', type=str, default=None,
@@ -107,21 +107,24 @@ def get_args_parser():
 
     # dataset parameters
     parser.add_argument('--dataset_file', default='coco')
-    parser.add_argument('--coco_path', default='./data/coco', type=str)
+    parser.add_argument('--coco_path', default='/root/autodl-tmp/coco_from_yolo', type=str)
     parser.add_argument('--coco_panoptic_path', type=str)
     parser.add_argument('--remove_difficult', action='store_true')
+    parser.add_argument('--num_classes', default=7, type=int,
+                        help='Number of object classes (default: auto-detect from dataset)')
 
-    parser.add_argument('--output_dir', default='',
+    parser.add_argument('--output_dir', default='/root/autodl-tmp/logs/deformable_detr-100-twostage-2',
                         help='path where to save, empty for no saving')
     parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
     parser.add_argument('--seed', default=42, type=int)
-    parser.add_argument('--resume', default='', help='resume from checkpoint')
+    parser.add_argument('--resume', default='/root/autodl-fs/r50_deformable_detr_7class.pth',
+                        help='resume from checkpoint')
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
                         help='start epoch')
     parser.add_argument('--eval', action='store_true')
     parser.add_argument('--num_workers', default=2, type=int)
-    parser.add_argument('--cache_mode', default=False, action='store_true', help='whether to cache images on memory')
+    parser.add_argument('--cache_mode', default=True, action='store_true', help='whether to cache images on memory')
 
     return parser
 
@@ -207,7 +210,12 @@ def main(args):
     else:
         optimizer = torch.optim.AdamW(param_dicts, lr=args.lr,
                                       weight_decay=args.weight_decay)
-    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop)
+
+    # Use MultiStepLR for multiple learning rate drops at specified epochs
+    if args.lr_drop_epochs:
+        lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, args.lr_drop_epochs, gamma=0.1)
+    else:
+        lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop)
 
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
@@ -225,12 +233,13 @@ def main(args):
         model_without_ddp.detr.load_state_dict(checkpoint['model'])
 
     output_dir = Path(args.output_dir)
-    if args.resume:
+    # if args.resume:
+    if args.resume and args.start_epoch != 0:
         if args.resume.startswith('https'):
             checkpoint = torch.hub.load_state_dict_from_url(
                 args.resume, map_location='cpu', check_hash=True)
         else:
-            checkpoint = torch.load(args.resume, map_location='cpu')
+            checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
         missing_keys, unexpected_keys = model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
         unexpected_keys = [k for k in unexpected_keys if not (k.endswith('total_params') or k.endswith('total_ops'))]
         if len(missing_keys) > 0:
