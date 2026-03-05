@@ -143,7 +143,7 @@ def complete_box_iou(boxes1, boxes2, eps=1e-7):
     return ciou
 
 
-def nwd_similarity_single(pred, target, eps=1e-7, constant=2.0, wh_divisor=4):
+def nwd_similarity_single(pred, target, eps=1e-7, constant=1.0, wh_divisor=4):
     """
     计算一对一框的 NWD 相似度（cxcywh 格式，归一化坐标）
 
@@ -153,7 +153,9 @@ def nwd_similarity_single(pred, target, eps=1e-7, constant=2.0, wh_divisor=4):
         pred: (N, 4) 预测框，cxcywh 格式，归一化坐标 [0,1]
         target: (N, 4) 目标框，cxcywh 格式，归一化坐标 [0,1]
         eps: 数值稳定性常数
-        constant: 缩放因子，归一化坐标建议 1.0~4.0，像素小目标用 8.0~12.8
+        constant: 缩放因子
+            - 归一化坐标: 建议 0.5~1.5（太小可能不稳定）
+            - 像素坐标: 建议 8.0~12.8
         wh_divisor: 宽高距离除数，4=工程近似，12=理论公式
 
     Returns:
@@ -218,7 +220,7 @@ def box_to_gaussian(boxes, eps=1e-7):
     return mu, sigma
 
 
-def nwd_similarity(boxes1, boxes2, eps=1e-7, constant=2.0, wh_divisor=4):
+def nwd_similarity(boxes1, boxes2, eps=1e-7, constant=1.0, wh_divisor=4):
     """
     计算 N×M 的 NWD 相似度矩阵（用于匈牙利匹配）
 
@@ -228,7 +230,7 @@ def nwd_similarity(boxes1, boxes2, eps=1e-7, constant=2.0, wh_divisor=4):
         boxes1: (N, 4) in cxcywh format, 归一化坐标 [0,1]
         boxes2: (M, 4) in cxcywh format, 归一化坐标 [0,1]
         eps: 数值稳定性常数
-        constant: 缩放因子，归一化坐标建议 1.0~4.0
+        constant: 缩放因子，归一化坐标建议 0.5~1.5
         wh_divisor: 宽高距离除数，4=工程近似，12=理论公式
 
     Returns:
@@ -253,7 +255,7 @@ def nwd_similarity(boxes1, boxes2, eps=1e-7, constant=2.0, wh_divisor=4):
     similarity = torch.exp(-torch.sqrt(wasserstein_2) / constant)
     return similarity
 
-def nwd_loss(boxes_pred, boxes_target, eps=1e-7, constant=2.0, wh_divisor=4):
+def nwd_loss(boxes_pred, boxes_target, eps=1e-7, constant=1.0, wh_divisor=4):
     """
     NWD Loss (一对一匹配，cxcywh 归一化坐标)
 
@@ -261,7 +263,7 @@ def nwd_loss(boxes_pred, boxes_target, eps=1e-7, constant=2.0, wh_divisor=4):
         boxes_pred: (N, 4) 预测框，cxcywh 格式，归一化坐标 [0,1]
         boxes_target: (N, 4) 目标框，cxcywh 格式，归一化坐标 [0,1]
         eps: 数值稳定性常数
-        constant: 缩放因子，归一化坐标建议 1.0~4.0
+        constant: 缩放因子，归一化坐标建议 0.5~1.5
         wh_divisor: 宽高距离除数，4=工程近似，12=理论公式
 
     Returns:
