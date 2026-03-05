@@ -159,11 +159,12 @@ def box_to_gaussian(boxes, eps=1e-7):
     """
     # 确保 boxes 是 float 类型
     boxes = boxes.float()
-    cx, cy, w, h = boxes.unbind(-1)
 
-    # 数值稳定性：防止 w, h 为 0 或负数
-    w = w.clamp(min=eps)
-    h = h.clamp(min=eps)
+    # 数值稳定性：限制 cx, cy 在合理范围内
+    cx = torch.clamp(boxes[:, 0], min=-10.0, max=10.0)
+    cy = torch.clamp(boxes[:, 1], min=-10.0, max=10.0)
+    w = torch.clamp(boxes[:, 2], min=eps, max=10.0)
+    h = torch.clamp(boxes[:, 3], min=eps, max=10.0)
 
     # 均值是边界框的中心点
     mu = torch.stack([cx, cy], dim=-1)
@@ -203,6 +204,9 @@ def nwd_similarity(boxes1, boxes2, eps=1e-7):
 
     wasserstein_sq = center_dist_sq + sigma_dist_sq
 
+    # 数值稳定性：clamp 防止 exp 下溢
+    wasserstein_sq = torch.clamp(wasserstein_sq, max=50.0)
+
     # NWD 相似度：值域 (0, 1]
     similarity = torch.exp(-wasserstein_sq / 2.0)
     return similarity
@@ -221,21 +225,33 @@ def nwd_loss(boxes_pred, boxes_target, eps=1e-7):
     Returns:
         loss: NWD 损失，标量
     """
-    # 1. 转换为高斯参数
+    # 1. 检查输入有效性
+    if boxes_pred.numel() == 0 or boxes_target.numel() == 0:
+        return torch.tensor(0.0, device=boxes_pred.device)
+
+    # 检查 NaN 或 Inf
+    if torch.isnan(boxes_pred).any() or torch.isinf(boxes_pred).any():
+        return torch.tensor(0.0, device=boxes_pred.device)
+
+    # 2. 转换为高斯参数
     mu1, sigma1 = box_to_gaussian(boxes_pred, eps)
     mu2, sigma2 = box_to_gaussian(boxes_target, eps)
 
-    # 2. 直接计算对应元素的距离 (Element-wise)，不广播
+    # 3. 直接计算对应元素的距离 (Element-wise)，不广播
     # 形状均为 (N, 2)
     center_dist_sq = (mu1 - mu2).pow(2).sum(dim=-1)
     sigma_dist_sq = (sigma1 - sigma2).pow(2).sum(dim=-1)
 
     wasserstein_sq = center_dist_sq + sigma_dist_sq
 
-    # 3. 计算相似度
+    # 4. 数值稳定性：clamp wasserstein_sq 防止 exp 下溢
+    # 当 wasserstein_sq > 50 时，exp(-25) ≈ 1.4e-11，已经非常接近 0
+    wasserstein_sq = torch.clamp(wasserstein_sq, max=50.0)
+
+    # 5. 计算相似度
     nwd_sim = torch.exp(-wasserstein_sq / 2.0)
 
-    # 4. 计算损失：1 - similarity
+    # 6. 计算损失：1 - similarity
     # 如果 nwd_sim 接近 1 (框重合)，loss 接近 0
     loss = (1.0 - nwd_sim).mean()
 
