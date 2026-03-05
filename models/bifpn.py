@@ -256,15 +256,17 @@ class BiFPN(nn.Module):
         weight = p5_w1 / (torch.sum(p5_w1, dim=0) + self.epsilon)
         p5_up = self.conv5up(self.swish(weight[0] * p5_in))
 
-        # P4_1 ← P4_0 + P5_1↑
+        # P4_1 ← P4_0 + P5_1↑ (动态上采样匹配尺寸)
         p4_w1 = self.p4_w1_relu(self.p4_w1)
         weight = p4_w1 / (torch.sum(p4_w1, dim=0) + self.epsilon)
-        p4_up = self.conv4up(self.swish(weight[0] * p4_in + weight[1] * self.p5_upsample(p5_up)))
+        p5_up_interp = F.interpolate(p5_up, size=p4_in.shape[-2:], mode='nearest')
+        p4_up = self.conv4up(self.swish(weight[0] * p4_in + weight[1] * p5_up_interp))
 
-        # P3_2 ← P3_0 + P4_1↑
+        # P3_2 ← P3_0 + P4_1↑ (动态上采样匹配尺寸)
         p3_w1 = self.p3_w1_relu(self.p3_w1)
         weight = p3_w1 / (torch.sum(p3_w1, dim=0) + self.epsilon)
-        p3_out = self.conv3up(self.swish(weight[0] * p3_in + weight[1] * self.p4_upsample(p4_up)))
+        p4_up_interp = F.interpolate(p4_up, size=p3_in.shape[-2:], mode='nearest')
+        p3_out = self.conv3up(self.swish(weight[0] * p3_in + weight[1] * p4_up_interp))
 
         # ========== Bottom-Up ==========
 
@@ -293,11 +295,13 @@ class BiFPN(nn.Module):
         # P5_1: 最高层
         p5_up = self.conv5up(self.swish(p5_in))
 
-        # P4_1 ← P4_0 + P5_1
-        p4_up = self.conv4up(self.swish(p4_in + self.p5_upsample(p5_up)))
+        # P4_1 ← P4_0 + P5_1 (动态上采样匹配尺寸)
+        p5_up_interp = F.interpolate(p5_up, size=p4_in.shape[-2:], mode='nearest')
+        p4_up = self.conv4up(self.swish(p4_in + p5_up_interp))
 
-        # P3_2 ← P3_0 + P4_1
-        p3_out = self.conv3up(self.swish(p3_in + self.p4_upsample(p4_up)))
+        # P3_2 ← P3_0 + P4_1 (动态上采样匹配尺寸)
+        p4_up_interp = F.interpolate(p4_up, size=p3_in.shape[-2:], mode='nearest')
+        p3_out = self.conv3up(self.swish(p3_in + p4_up_interp))
 
         # ========== Bottom-Up ==========
 
