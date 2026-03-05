@@ -109,7 +109,7 @@ def get_args_parser():
     parser.add_argument('--cls_loss_coef', default=2, type=float)
     parser.add_argument('--bbox_loss_coef', default=5, type=float)
     parser.add_argument('--giou_loss_coef', default=2, type=float)
-    parser.add_argument('--nwd_loss_coef', default=2, type=float,
+    parser.add_argument('--nwd_loss_coef', default=10, type=float,  # 增加权重以平衡 NWD loss 较小的问题
                        help='weight of NWD loss for small object detection (set to 0 to disable)')
     parser.add_argument('--focal_alpha', default=0.25, type=float)
 

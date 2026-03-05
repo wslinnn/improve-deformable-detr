@@ -143,7 +143,7 @@ def complete_box_iou(boxes1, boxes2, eps=1e-7):
     return ciou
 
 
-def nwd_similarity_single(pred, target, eps=1e-7, constant=1.0, wh_divisor=4):
+def nwd_similarity_single(pred, target, eps=1e-7, constant=0.5, wh_divisor=12):
     """
     计算一对一框的 NWD 相似度（cxcywh 格式，归一化坐标）
 
@@ -154,9 +154,11 @@ def nwd_similarity_single(pred, target, eps=1e-7, constant=1.0, wh_divisor=4):
         target: (N, 4) 目标框，cxcywh 格式，归一化坐标 [0,1]
         eps: 数值稳定性常数
         constant: 缩放因子
-            - 归一化坐标: 建议 0.5~1.5（太小可能不稳定）
+            - 归一化坐标: 建议 0.3~0.8（更敏感）
             - 像素坐标: 建议 8.0~12.8
-        wh_divisor: 宽高距离除数，4=工程近似，12=理论公式
+        wh_divisor: 宽高距离除数
+            - 4=工程近似（YOLO 等）
+            - 12=理论公式（更敏感，适合小目标）
 
     Returns:
         similarity: (N,) 值域 (0,1]，1=完全相同
@@ -173,7 +175,7 @@ def nwd_similarity_single(pred, target, eps=1e-7, constant=1.0, wh_divisor=4):
     # 中心距离平方
     center_distance = (pred_cx - tgt_cx) ** 2 + (pred_cy - tgt_cy) ** 2 + eps
 
-    # 尺寸距离（可切换 /4 或 /12）
+    # 尺寸距离（使用 /12 增加敏感度）
     wh_distance = ((pred_w - tgt_w) ** 2 + (pred_h - tgt_h) ** 2) / wh_divisor
 
     wasserstein_2 = center_distance + wh_distance
@@ -220,7 +222,7 @@ def box_to_gaussian(boxes, eps=1e-7):
     return mu, sigma
 
 
-def nwd_similarity(boxes1, boxes2, eps=1e-7, constant=1.0, wh_divisor=4):
+def nwd_similarity(boxes1, boxes2, eps=1e-7, constant=0.5, wh_divisor=12):
     """
     计算 N×M 的 NWD 相似度矩阵（用于匈牙利匹配）
 
@@ -230,8 +232,8 @@ def nwd_similarity(boxes1, boxes2, eps=1e-7, constant=1.0, wh_divisor=4):
         boxes1: (N, 4) in cxcywh format, 归一化坐标 [0,1]
         boxes2: (M, 4) in cxcywh format, 归一化坐标 [0,1]
         eps: 数值稳定性常数
-        constant: 缩放因子，归一化坐标建议 0.5~1.5
-        wh_divisor: 宽高距离除数，4=工程近似，12=理论公式
+        constant: 缩放因子，归一化坐标建议 0.3~0.8
+        wh_divisor: 宽高距离除数，12=理论公式（更敏感）
 
     Returns:
         similarity: (N, M) NWD 相似度矩阵，值域 (0, 1]
@@ -255,7 +257,7 @@ def nwd_similarity(boxes1, boxes2, eps=1e-7, constant=1.0, wh_divisor=4):
     similarity = torch.exp(-torch.sqrt(wasserstein_2) / constant)
     return similarity
 
-def nwd_loss(boxes_pred, boxes_target, eps=1e-7, constant=1.0, wh_divisor=4):
+def nwd_loss(boxes_pred, boxes_target, eps=1e-7, constant=0.5, wh_divisor=12):
     """
     NWD Loss (一对一匹配，cxcywh 归一化坐标)
 
@@ -263,8 +265,8 @@ def nwd_loss(boxes_pred, boxes_target, eps=1e-7, constant=1.0, wh_divisor=4):
         boxes_pred: (N, 4) 预测框，cxcywh 格式，归一化坐标 [0,1]
         boxes_target: (N, 4) 目标框，cxcywh 格式，归一化坐标 [0,1]
         eps: 数值稳定性常数
-        constant: 缩放因子，归一化坐标建议 0.5~1.5
-        wh_divisor: 宽高距离除数，4=工程近似，12=理论公式
+        constant: 缩放因子，归一化坐标建议 0.3~0.8
+        wh_divisor: 宽高距离除数，12=理论公式（更敏感）
 
     Returns:
         loss: 标量，值域 [0, 1)
