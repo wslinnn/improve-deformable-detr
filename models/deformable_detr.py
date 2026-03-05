@@ -346,12 +346,8 @@ class SetCriterion(nn.Module):
         # 即使框不重叠，NWD 也能提供平滑的梯度
         # 使用 NWD 作为 GIoU 的补充
         # 使用优化后的 nwd_loss 函数 (O(N) 复杂度)
-        # 安全检查：确保 boxes 非空且有效
-        if src_boxes.numel() > 0 and target_boxes.numel() > 0 and num_boxes > 0:
-            loss_nwd = box_ops.nwd_loss(src_boxes, target_boxes)
-            losses['loss_nwd'] = loss_nwd
-        else:
-            losses['loss_nwd'] = torch.tensor(0.0, device=src_boxes.device)
+        loss_nwd = box_ops.nwd_loss(src_boxes, target_boxes)
+        losses['loss_nwd'] = loss_nwd
 
         return losses
 
