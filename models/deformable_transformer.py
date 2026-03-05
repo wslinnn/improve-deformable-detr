@@ -32,16 +32,12 @@ class DeformableTransformer(nn.Module):
         self.nhead = nhead
         self.two_stage = two_stage
         self.two_stage_num_proposals = two_stage_num_proposals
-        self.num_feature_levels = num_feature_levels
 
-        # 非对称采样：Encoder 处理 4 层（C3-C6），Decoder 处理 5 层（C2-C6）
-        # Encoder 使用固定的 n_levels=4
         encoder_layer = DeformableTransformerEncoderLayer(d_model, dim_feedforward,
                                                           dropout, activation,
-                                                          4, nhead, enc_n_points)
+                                                          num_feature_levels, nhead, enc_n_points)
         self.encoder = DeformableTransformerEncoder(encoder_layer, num_encoder_layers)
 
-        # Decoder 使用完整的 n_levels=num_feature_levels
         decoder_layer = DeformableTransformerDecoderLayer(d_model, dim_feedforward,
                                                           dropout, activation,
                                                           num_feature_levels, nhead, dec_n_points)
@@ -70,14 +66,6 @@ class DeformableTransformer(nn.Module):
             xavier_uniform_(self.reference_points.weight.data, gain=1.0)
             constant_(self.reference_points.bias.data, 0.)
         normal_(self.level_embed)
-
-        # 非对称采样：让C2和C3的level_embed初始值保持一致
-        # 注意：此时level_embed都是随机初始化的，不是预训练权重
-        # 真正有效的预训练权重迁移在 main.py 加载 checkpoint 后执行
-        # 这里只是为了保证C2和C3的初始状态同步，避免训练初期的不稳定
-        if self.num_feature_levels == 5:  # 确保是5层模式
-            with torch.no_grad():
-                self.level_embed[4].copy_(self.level_embed[0])
 
     def get_proposal_pos_embed(self, proposals):
         num_pos_feats = 128
@@ -138,74 +126,41 @@ class DeformableTransformer(nn.Module):
     def forward(self, srcs, masks, pos_embeds, query_embed=None):
         assert self.two_stage or query_embed is not None
 
-        # ========== 第一步：准备 Encoder 输入（非对称采样：跳过 C2）==========
-        # 特征顺序：[C2, C3, C4, C5, C6]，索引 0 是 C2
-        # Encoder 只处理 C3, C4, C5, C6（索引 1-4）
+        # prepare input for encoder
         src_flatten = []
         mask_flatten = []
         lvl_pos_embed_flatten = []
-        spatial_shapes_enc = []
-
-        # 从索引 1 开始，跳过 C2
-        for l in range(1, len(srcs)):  # l = 1, 2, 3, 4 -> C3, C4, C5, C6
-            src, mask, pos = srcs[l], masks[l], pos_embeds[l]
+        spatial_shapes = []
+        for lvl, (src, mask, pos_embed) in enumerate(zip(srcs, masks, pos_embeds)):
             bs, c, h, w = src.shape
-            spatial_shapes_enc.append((h, w))
+            spatial_shape = (h, w)
+            spatial_shapes.append(spatial_shape)
             src = src.flatten(2).transpose(1, 2)
             mask = mask.flatten(1)
-            pos = pos.flatten(2).transpose(1, 2)
-            # 注意：l=1 对应 C3，使用 level_embed[l-1] = level_embed[0]（预训练权重）
-            lvl_pos_embed = pos + self.level_embed[l - 1].view(1, 1, -1)
+            pos_embed = pos_embed.flatten(2).transpose(1, 2)
+            lvl_pos_embed = pos_embed + self.level_embed[lvl].view(1, 1, -1)
             lvl_pos_embed_flatten.append(lvl_pos_embed)
             src_flatten.append(src)
             mask_flatten.append(mask)
-
         src_flatten = torch.cat(src_flatten, 1)
         mask_flatten = torch.cat(mask_flatten, 1)
         lvl_pos_embed_flatten = torch.cat(lvl_pos_embed_flatten, 1)
-        spatial_shapes_enc = torch.as_tensor(spatial_shapes_enc, dtype=torch.long, device=src_flatten.device)
-        level_start_index_enc = torch.cat((spatial_shapes_enc.new_zeros((1, )), spatial_shapes_enc.prod(1).cumsum(0)[:-1]))
-        valid_ratios_enc = torch.stack([self.get_valid_ratio(masks[l]) for l in range(1, len(srcs))], 1)
+        spatial_shapes = torch.as_tensor(spatial_shapes, dtype=torch.long, device=src_flatten.device)
+        level_start_index = torch.cat((spatial_shapes.new_zeros((1, )), spatial_shapes.prod(1).cumsum(0)[:-1]))
+        valid_ratios = torch.stack([self.get_valid_ratio(m) for m in masks], 1)
 
-        # ========== 第二步：执行 Encoder ==========
-        memory = self.encoder(src_flatten, spatial_shapes_enc, level_start_index_enc, valid_ratios_enc, lvl_pos_embed_flatten, mask_flatten)
+        # encoder
+        memory = self.encoder(src_flatten, spatial_shapes, level_start_index, valid_ratios, lvl_pos_embed_flatten, mask_flatten)
 
-        # ========== 第三步：准备 C2 特征并拼接 ==========
-        # 处理被跳过的 C2（索引 0）
-        c2_h, c2_w = srcs[0].shape[-2:]
-        c2_flatten = srcs[0].flatten(2).transpose(1, 2)
-        c2_mask = masks[0].flatten(1)
-        c2_pos = pos_embeds[0].flatten(2).transpose(1, 2)
-        # C2 使用新的 level_embed[4]（随机初始化）
-        c2_pos = c2_pos + self.level_embed[4].view(1, 1, -1)
-
-        # 拼接：C2 在前，Encoder Memory 在后
-        full_memory = torch.cat([c2_flatten, memory], dim=1)
-        full_mask_flatten = torch.cat([c2_mask, mask_flatten], dim=1)
-
-        # 构造 Decoder 用的全量形状
-        full_spatial_shapes = torch.cat([
-            torch.as_tensor([(c2_h, c2_w)], device=spatial_shapes_enc.device),
-            spatial_shapes_enc
-        ], dim=0)
-        full_level_start_index = torch.cat((
-            full_spatial_shapes.new_zeros((1,)),
-            full_spatial_shapes.prod(1).cumsum(0)[:-1]
-        ))
-        full_valid_ratios = torch.cat([
-            self.get_valid_ratio(masks[0]).unsqueeze(1),
-            valid_ratios_enc
-        ], dim=1)
-
-        # ========== 第四步：Two-Stage Proposal 生成 和 Decoder 执行 ==========
-        bs, _, c = full_memory.shape
+        # prepare input for decoder
+        bs, _, c = memory.shape
         if self.two_stage:
-            # Two-Stage：基于 Encoder Memory 生成 proposals（不包含 C2，保持兼容性）
-            # 但使用 full_spatial_shapes（包含 C2）来计算 valid_ratios
-            # 注意：这里我们需要用 encoder 的 spatial_shapes_enc 来生成 proposals
-            output_memory, output_proposals = self.gen_encoder_output_proposals(memory, mask_flatten, spatial_shapes_enc)
+            output_memory, output_proposals = self.gen_encoder_output_proposals(memory, mask_flatten, spatial_shapes)
+
+            # hack implementation for two-stage Deformable DETR
             enc_outputs_class = self.decoder.class_embed[self.decoder.num_layers](output_memory)
             enc_outputs_coord_unact = self.decoder.bbox_embed[self.decoder.num_layers](output_memory) + output_proposals
+
             topk = self.two_stage_num_proposals
             topk_proposals = torch.topk(enc_outputs_class[..., 0], topk, dim=1)[1]
             topk_coords_unact = torch.gather(enc_outputs_coord_unact, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, 4))
@@ -221,11 +176,9 @@ class DeformableTransformer(nn.Module):
             reference_points = self.reference_points(query_embed).sigmoid()
             init_reference_out = reference_points
 
-        # ========== 第五步：执行 Decoder ==========
-        # Decoder 使用 full_memory（包含 C2），可以在 5 个特征层上采样
-        hs, inter_references = self.decoder(tgt, reference_points, full_memory,
-                                            full_spatial_shapes, full_level_start_index, full_valid_ratios,
-                                            query_embed, full_mask_flatten)
+        # decoder
+        hs, inter_references = self.decoder(tgt, reference_points, memory,
+                                            spatial_shapes, level_start_index, valid_ratios, query_embed, mask_flatten)
 
         inter_references_out = inter_references
         if self.two_stage:

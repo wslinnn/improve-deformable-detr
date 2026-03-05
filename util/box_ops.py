@@ -11,7 +11,11 @@
 Utilities for bounding box manipulation and GIoU.
 """
 import torch
+import math
 from torchvision.ops.boxes import box_area
+
+# NWD 常量：预计算 sqrt(12)，避免重复创建 tensor
+SQRT_12 = math.sqrt(12.0)
 
 
 def box_cxcywh_to_xyxy(x):
@@ -137,6 +141,105 @@ def complete_box_iou(boxes1, boxes2, eps=1e-7):
     ciou = ciou.clamp(min=-1.0, max=1.0)
 
     return ciou
+
+
+def box_to_gaussian(boxes, eps=1e-7):
+    """
+    将边界框建模为二维高斯分布
+
+    假设边界框内服从均匀分布，则方差 = (range)² / 12
+
+    Args:
+        boxes: (N, 4) in cxcywh format, each box is (cx, cy, w, h)
+        eps: 防止除零或标准差为 0 的数值稳定性参数
+
+    Returns:
+        mu: (N, 2) 高斯分布的均值 (中心点坐标)
+        sigma: (N, 2) 高斯分布的标准差 (std_w, std_h)
+    """
+    # 确保 boxes 是 float 类型
+    boxes = boxes.float()
+    cx, cy, w, h = boxes.unbind(-1)
+
+    # 数值稳定性：防止 w, h 为 0 或负数
+    w = w.clamp(min=eps)
+    h = h.clamp(min=eps)
+
+    # 均值是边界框的中心点
+    mu = torch.stack([cx, cy], dim=-1)
+
+    # 对于均匀分布，方差 = range² / 12，标准差 = range / sqrt(12)
+    # 使用预计算的 SQRT_12 常数，避免重复创建 tensor
+    sigma_w = w / SQRT_12
+    sigma_h = h / SQRT_12
+
+    sigma = torch.stack([sigma_w, sigma_h], dim=-1)
+
+    return mu, sigma
+
+
+def nwd_similarity(boxes1, boxes2, eps=1e-7):
+    """
+    计算两个框集合之间的 NWD 相似度矩阵
+
+    注意：返回值是相似度 (1 表示相同，0 表示不同)，不是距离
+    如果用于 Loss 计算且框是一一对应的，请使用 nwd_loss 以获得更高性能
+
+    Args:
+        boxes1: (N, 4) in cxcywh format
+        boxes2: (M, 4) in cxcywh format
+        eps: 小常数，用于数值稳定性
+
+    Returns:
+        nwd: (N, M) NWD 相似度矩阵，值域 (0, 1]
+              1 表示完全相同，0 表示完全不相关
+    """
+    mu1, sigma1 = box_to_gaussian(boxes1, eps)
+    mu2, sigma2 = box_to_gaussian(boxes2, eps)
+
+    # (N, 1, 2) - (1, M, 2) -> (N, M, 2)
+    center_dist_sq = (mu1[:, None, :] - mu2[None, :, :]).pow(2).sum(-1)
+    sigma_dist_sq = (sigma1[:, None, :] - sigma2[None, :, :]).pow(2).sum(-1)
+
+    wasserstein_sq = center_dist_sq + sigma_dist_sq
+
+    # NWD 相似度：值域 (0, 1]
+    similarity = torch.exp(-wasserstein_sq / 2.0)
+    return similarity
+
+def nwd_loss(boxes_pred, boxes_target, eps=1e-7):
+    """
+    基于 NWD 的损失函数 (一对一匹配模式)
+
+    优化版：直接计算对角线元素，避免 O(N²) 的矩阵计算
+
+    Args:
+        boxes_pred: (N, 4) 预测框，cxcywh 格式
+        boxes_target: (N, 4) 目标框，cxcywh 格式
+        eps: 小常数，用于数值稳定性
+
+    Returns:
+        loss: NWD 损失，标量
+    """
+    # 1. 转换为高斯参数
+    mu1, sigma1 = box_to_gaussian(boxes_pred, eps)
+    mu2, sigma2 = box_to_gaussian(boxes_target, eps)
+
+    # 2. 直接计算对应元素的距离 (Element-wise)，不广播
+    # 形状均为 (N, 2)
+    center_dist_sq = (mu1 - mu2).pow(2).sum(dim=-1)
+    sigma_dist_sq = (sigma1 - sigma2).pow(2).sum(dim=-1)
+
+    wasserstein_sq = center_dist_sq + sigma_dist_sq
+
+    # 3. 计算相似度
+    nwd_sim = torch.exp(-wasserstein_sq / 2.0)
+
+    # 4. 计算损失：1 - similarity
+    # 如果 nwd_sim 接近 1 (框重合)，loss 接近 0
+    loss = (1.0 - nwd_sim).mean()
+
+    return loss
 
 
 def masks_to_boxes(masks):

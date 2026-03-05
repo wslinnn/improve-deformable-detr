@@ -25,6 +25,7 @@ from .matcher import build_matcher
 from .segmentation import (DETRsegm, PostProcessPanoptic, PostProcessSegm,
                            dice_loss, sigmoid_focal_loss)
 from .deformable_transformer import build_deforamble_transformer
+from .bifpn import build_bifpn
 import copy
 
 
@@ -35,7 +36,8 @@ def _get_clones(module, N):
 class DeformableDETR(nn.Module):
     """ This is the Deformable DETR module that performs object detection """
     def __init__(self, backbone, transformer, num_classes, num_queries, num_feature_levels,
-                 aux_loss=True, with_box_refine=False, two_stage=False):
+                 aux_loss=True, with_box_refine=False, two_stage=False,
+                 use_bifpn=False):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -46,6 +48,7 @@ class DeformableDETR(nn.Module):
             aux_loss: True if auxiliary decoding losses (loss at each decoder layer) are to be used.
             with_box_refine: iterative bounding box refinement
             two_stage: two-stage Deformable DETR
+            use_bifpn: enable Bi-directional Feature Pyramid Network (BiFPN)
         """
         super().__init__()
         self.num_queries = num_queries
@@ -82,6 +85,21 @@ class DeformableDETR(nn.Module):
         self.aux_loss = aux_loss
         self.with_box_refine = with_box_refine
         self.two_stage = two_stage
+
+        # ========== BiFPN: 双向特征金字塔网络 ==========
+        # 在输入到 Transformer 之前，使用 BiFPN 增强多尺度特征
+        # 这样可以：
+        # 1. 让低层特征（如 C3）接收高层的语义信息
+        # 2. 让高层特征接收低层的细节信息
+        # 3. 提升小目标检测的性能
+        self.use_bifpn = use_bifpn
+        if self.use_bifpn and num_feature_levels > 1:
+            # 获取 backbone 输出的通道数（对应不同的特征层）
+            backbone_channels = backbone.num_channels
+            self.bifpn = build_bifpn(
+                channels=backbone_channels,
+                hidden_dim=hidden_dim
+            )
 
         prior_prob = 0.01
         bias_value = -math.log((1 - prior_prob) / prior_prob)
@@ -130,20 +148,64 @@ class DeformableDETR(nn.Module):
             samples = nested_tensor_from_tensor_list(samples)
         features, pos = self.backbone(samples)
 
+        # ========== 原始代码：直接进行 input_proj（已注释）==========
+        # srcs = []
+        # masks = []
+        # for l, feat in enumerate(features):
+        #     src, mask = feat.decompose()
+        #     srcs.append(self.input_proj[l](src))
+        #     masks.append(mask)
+        #     assert mask is not None
+
+        # ========== BiFPN: 先进行跨尺度特征融合，再 input_proj ==========
         srcs = []
         masks = []
-        for l, feat in enumerate(features):
-            src, mask = feat.decompose()
-            srcs.append(self.input_proj[l](src))
-            masks.append(mask)
-            assert mask is not None
+
+        if self.use_bifpn and self.num_feature_levels > 1:
+            # 使用 BiFPN 增强多尺度特征 (3 层: P3, P4, P5)
+            # 1. 提取所有特征层的 tensors
+            feat_tensors = []
+
+            for feat in features:
+                src, _ = feat.decompose()
+                feat_tensors.append(src)
+
+            # 2. 使用 BiFPN 进行双向跨尺度融合
+            # BiFPNUnified 会先将特征投影到 hidden_dim，然后进行融合
+            # 输出已经是 hidden_dim 维度，不需要再经过 input_proj!
+            enhanced_tensors = self.bifpn(feat_tensors)
+
+            # 3. 对 BiFPN 输出进行 normalization (保持与原始设计一致)
+            for l, enhanced_feat in enumerate(enhanced_tensors):
+                # BiFPN 输出已经经过 BatchNorm，但为了与原始 design 一致，
+                # 这里添加一个简单的 LayerNorm
+                # 或者直接使用，因为 BatchNorm 已经提供了 normalization
+                src = enhanced_feat
+                mask = features[l].mask  # 使用原始 mask
+                srcs.append(src)
+                masks.append(mask)
+        else:
+            # 原始流程：直接 input_proj（不使用 BiFPN）
+            for l, feat in enumerate(features):
+                src, mask = feat.decompose()
+                srcs.append(self.input_proj[l](src))
+                masks.append(mask)
+                assert mask is not None
+
+        # ========== 处理额外的特征层（如 P6，通过下采样 P5 生成）==========
         if self.num_feature_levels > len(srcs):
             _len_srcs = len(srcs)
             for l in range(_len_srcs, self.num_feature_levels):
-                if l == _len_srcs:
-                    src = self.input_proj[l](features[-1].tensors)
+                if self.use_bifpn and self.num_feature_levels > 1:
+                    # BiFPN 模式：srcs[-1] 已经是 hidden_dim 维度
+                    # 直接下采样生成额外层级，不需要再经过 input_proj
+                    src = F.max_pool2d(srcs[-1], kernel_size=3, stride=2, padding=1)
                 else:
-                    src = self.input_proj[l](srcs[-1])
+                    # 原始模式：使用 input_proj 生成额外层级
+                    if l == _len_srcs:
+                        src = self.input_proj[l](features[-1].tensors)
+                    else:
+                        src = self.input_proj[l](srcs[-1])
                 m = samples.mask
                 mask = F.interpolate(m[None].float(), size=src.shape[-2:]).to(torch.bool)[0]
                 pos_l = self.backbone[1](NestedTensor(src, mask)).to(src.dtype)
@@ -258,7 +320,7 @@ class SetCriterion(nn.Module):
         return losses
 
     def loss_boxes(self, outputs, targets, indices, num_boxes):
-        """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU/CIoU loss
+        """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU/CIoU/NWD loss
            targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
            The target boxes are expected in format (center_x, center_y, h, w), normalized by the image size.
         """
@@ -272,20 +334,21 @@ class SetCriterion(nn.Module):
         losses = {}
         losses['loss_bbox'] = loss_bbox.sum() / num_boxes
 
-        # ========== GIoU Loss (原始版本) ==========
-        # loss_giou = 1 - torch.diag(box_ops.generalized_box_iou(
-        #     box_ops.box_cxcywh_to_xyxy(src_boxes),
-        #     box_ops.box_cxcywh_to_xyxy(target_boxes)))
-        # losses['loss_giou'] = loss_giou.sum() / num_boxes
-
-        # ========== CIoU Loss (改进版本) ==========
-        # CIoU = IoU - (center_distance / diagonal_length) - aspect_ratio_consistency
-        # 参考: https://arxiv.org/abs/1911.08287
-        # 优势: 考虑中心点距离和宽高比，收敛更快，定位更精确
-        loss_ciou = 1 - torch.diag(box_ops.complete_box_iou(
+        # ========== GIoU Loss ==========
+        # 使用原始的 GIoU Loss
+        loss_giou = 1 - torch.diag(box_ops.generalized_box_iou(
             box_ops.box_cxcywh_to_xyxy(src_boxes),
             box_ops.box_cxcywh_to_xyxy(target_boxes)))
-        losses['loss_giou'] = loss_ciou.sum() / num_boxes  # 保持 key 不变以兼容训练日志
+        losses['loss_giou'] = loss_giou.sum() / num_boxes
+
+        # ========== NWD Loss (新增) ==========
+        # NWD (Normalized Wasserstein Distance) 对小目标友好
+        # 即使框不重叠，NWD 也能提供平滑的梯度
+        # 使用 NWD 作为 GIoU 的补充
+        # 使用优化后的 nwd_loss 函数 (O(N) 复杂度)
+        loss_nwd = box_ops.nwd_loss(src_boxes, target_boxes)
+        losses['loss_nwd'] = loss_nwd
+
         return losses
 
     def loss_masks(self, outputs, targets, indices, num_boxes):
@@ -466,6 +529,10 @@ def build(args):
     backbone = build_backbone(args)
 
     transformer = build_deforamble_transformer(args)
+
+    # 获取 BiFPN 参数
+    use_bifpn = getattr(args, 'use_bifpn', False)
+
     model = DeformableDETR(
         backbone,
         transformer,
@@ -475,12 +542,14 @@ def build(args):
         aux_loss=args.aux_loss,
         with_box_refine=args.with_box_refine,
         two_stage=args.two_stage,
+        use_bifpn=use_bifpn,
     )
     if args.masks:
         model = DETRsegm(model, freeze_detr=(args.frozen_weights is not None))
     matcher = build_matcher(args)
     weight_dict = {'loss_ce': args.cls_loss_coef, 'loss_bbox': args.bbox_loss_coef}
     weight_dict['loss_giou'] = args.giou_loss_coef
+    weight_dict['loss_nwd'] = getattr(args, 'nwd_loss_coef', 1.0)  # NWD loss 权重
     if args.masks:
         weight_dict["loss_mask"] = args.mask_loss_coef
         weight_dict["loss_dice"] = args.dice_loss_coef

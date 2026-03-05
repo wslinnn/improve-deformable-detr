@@ -48,6 +48,10 @@ def get_args_parser():
     parser.add_argument('--with_box_refine', default=True, action='store_true')
     parser.add_argument('--two_stage', default=True, action='store_true')
 
+    # BiFPN: 双向特征金字塔网络
+    parser.add_argument('--use_bifpn', default=True, action='store_true',
+                       help='enable Bi-directional Feature Pyramid Network')
+
     # Model parameters
     parser.add_argument('--frozen_weights', type=str, default=None,
                         help="Path to the pretrained model. If set, only the mask head will be trained")
@@ -61,10 +65,7 @@ def get_args_parser():
                         help="Type of positional embedding to use on top of the image features")
     parser.add_argument('--position_embedding_scale', default=2 * np.pi, type=float,
                         help="position / size * scale")
-    parser.add_argument('--num_feature_levels', default=5, type=int, help='number of feature levels')
-    # 原始默认值: default=4 (对应 C3, C4, C5 + 1层下采样 C6)
-    # 新默认值: default=5 (对应 C3, C4, C5, C6, C2) - 非对称采样
-    # 注意：C2 在最后是为了保持与预训练权重的兼容性（level_embed[0:4] 对应 C3-C6）
+    parser.add_argument('--num_feature_levels', default=4, type=int, help='number of feature levels')
 
     # * Transformer
     parser.add_argument('--enc_layers', default=4, type=int,
@@ -81,7 +82,7 @@ def get_args_parser():
                         help="Number of attention heads inside the transformer's attentions")
     parser.add_argument('--num_queries', default=300, type=int,
                         help="Number of query slots")
-    parser.add_argument('--dec_n_points', default=8, type=int)
+    parser.add_argument('--dec_n_points', default=4, type=int)
     parser.add_argument('--enc_n_points', default=4, type=int)
 
     # * Segmentation
@@ -99,6 +100,8 @@ def get_args_parser():
                         help="L1 box coefficient in the matching cost")
     parser.add_argument('--set_cost_giou', default=2, type=float,
                         help="giou box coefficient in the matching cost")
+    parser.add_argument('--set_cost_nwd', default=2, type=float,
+                        help="NWD box coefficient in the matching cost (set to 0 to disable)")
 
     # * Loss coefficients
     parser.add_argument('--mask_loss_coef', default=1, type=float)
@@ -106,6 +109,8 @@ def get_args_parser():
     parser.add_argument('--cls_loss_coef', default=2, type=float)
     parser.add_argument('--bbox_loss_coef', default=5, type=float)
     parser.add_argument('--giou_loss_coef', default=2, type=float)
+    parser.add_argument('--nwd_loss_coef', default=2, type=float,
+                       help='weight of NWD loss for small object detection (set to 0 to disable)')
     parser.add_argument('--focal_alpha', default=0.25, type=float)
 
     # dataset parameters
@@ -272,60 +277,6 @@ def main(args):
             test_stats, coco_evaluator = evaluate(
                 model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir
             )
-
-    # # ========== 非对称采样权重迁移 ==========
-    # # 在加载预训练权重后，用C3的权重初始化C2
-    # print('\n=== Asymmetric Sampling Weight Transfer ===')
-    #
-    # # 1. level_embed: 用C3初始化C2
-    # if hasattr(model_without_ddp, 'transformer') and hasattr(model_without_ddp.transformer, 'level_embed'):
-    #     if model_without_ddp.transformer.level_embed.shape[0] == 5:
-    #         with torch.no_grad():
-    #             model_without_ddp.transformer.level_embed[4].copy_(model_without_ddp.transformer.level_embed[0])
-    #         print('✓ Initialized C2 level_embed with C3 pretrained weights')
-    #
-    # # 2. input_proj: 用C3的前256通道初始化C2
-    # if hasattr(model_without_ddp, 'input_proj') and len(model_without_ddp.input_proj) >= 2:
-    #     with torch.no_grad():
-    #         w_c3 = model_without_ddp.input_proj[1][0].weight  # [256, 512, 1, 1]
-    #         b_c3 = model_without_ddp.input_proj[1][0].bias  # [256]
-    #         model_without_ddp.input_proj[0][0].weight.copy_(w_c3[:, :256, :, :])
-    #         model_without_ddp.input_proj[0][0].bias.copy_(b_c3)
-    #         # 同样初始化 GroupNorm 的 weight 和 bias
-    #         if hasattr(model_without_ddp.input_proj[0][0], 'weight'):
-    #             # input_proj 是 nn.Sequential，第二个是 GroupNorm
-    #             gn_c3_weight = model_without_ddp.input_proj[1][1].weight
-    #             gn_c3_bias = model_without_ddp.input_proj[1][1].bias
-    #             model_without_ddp.input_proj[0][1].weight.copy_(gn_c3_weight)
-    #             model_without_ddp.input_proj[0][1].bias.copy_(gn_c3_bias)
-    #         print('✓ Initialized C2 input_proj with C3 pretrained weights (first 256 channels)')
-    #
-    # # 3. 验证 Backbone C2 权重是否加载
-    # if hasattr(model_without_ddp, 'backbone'):
-    #     # 检查 ResNet layer1 的权重
-    #     layer1_weight = None
-    #     for name, param in model_without_ddp.named_parameters():
-    #         if 'layer1' in name and 'conv1' in name and 'weight' in name:
-    #             layer1_weight = param
-    #             break
-    #     if layer1_weight is not None:
-    #         weight_sum = layer1_weight.sum().item()
-    #         if abs(weight_sum) > 1e-6:  # 不是全零
-    #             print(f'✓ Backbone C2 (layer1) weights loaded (sum={weight_sum:.4f})')
-    #         else:
-    #             print('⚠ Backbone C2 (layer1) weights appear to be zero!')
-    #     else:
-    #         print('⚠ Could not verify Backbone C2 weights')
-    #
-    # print('=== Weight Transfer Complete ===\n')
-    #
-    # # 非对称采样：用加载后的C3 level_embed初始化C2
-    # # 必须在load_state_dict之后执行，因为此时C3的level_embed才有预训练权重
-    # if hasattr(model_without_ddp, 'transformer') and hasattr(model_without_ddp.transformer, 'level_embed'):
-    #     if model_without_ddp.transformer.level_embed.shape[0] == 5:
-    #         with torch.no_grad():
-    #             model_without_ddp.transformer.level_embed[4].copy_(model_without_ddp.transformer.level_embed[0])
-    #         print('Initialized C2 level_embed with C3 pretrained weights')
 
     if args.eval:
         test_stats, coco_evaluator = evaluate(model, criterion, postprocessors,

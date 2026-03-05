@@ -14,7 +14,7 @@ import torch
 from scipy.optimize import linear_sum_assignment
 from torch import nn
 
-from util.box_ops import box_cxcywh_to_xyxy, generalized_box_iou
+from util.box_ops import box_cxcywh_to_xyxy, generalized_box_iou, nwd_similarity
 
 
 class HungarianMatcher(nn.Module):
@@ -28,19 +28,22 @@ class HungarianMatcher(nn.Module):
     def __init__(self,
                  cost_class: float = 1,
                  cost_bbox: float = 1,
-                 cost_giou: float = 1):
+                 cost_giou: float = 1,
+                 cost_nwd: float = 0.0):
         """Creates the matcher
 
         Params:
             cost_class: This is the relative weight of the classification error in the matching cost
             cost_bbox: This is the relative weight of the L1 error of the bounding box coordinates in the matching cost
             cost_giou: This is the relative weight of the giou loss of the bounding box in the matching cost
+            cost_nwd: This is the relative weight of the NWD (Normalized Wasserstein Distance) in the matching cost
         """
         super().__init__()
         self.cost_class = cost_class
         self.cost_bbox = cost_bbox
         self.cost_giou = cost_giou
-        assert cost_class != 0 or cost_bbox != 0 or cost_giou != 0, "all costs cant be 0"
+        self.cost_nwd = cost_nwd
+        assert cost_class != 0 or cost_bbox != 0 or cost_giou != 0 or cost_nwd != 0, "all costs cant be 0"
 
     def forward(self, outputs, targets):
         """ Performs the matching
@@ -83,12 +86,25 @@ class HungarianMatcher(nn.Module):
             # Compute the L1 cost between boxes
             cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
 
-            # Compute the giou cost betwen boxes
+            # Compute the GIoU/CIoU cost between boxes
             cost_giou = -generalized_box_iou(box_cxcywh_to_xyxy(out_bbox),
                                              box_cxcywh_to_xyxy(tgt_bbox))
 
+            # Compute the NWD cost between boxes (if enabled)
+            # NWD 对小目标友好，即使框不重叠也能提供平滑梯度
+            if self.cost_nwd > 0:
+                # NWD 相似度返回 [0, 1]，1 表示完全相同，0 表示完全不同
+                # 转换为成本：相似度越高，成本越低
+                nwd_matrix = nwd_similarity(out_bbox, tgt_bbox)
+                cost_nwd = -nwd_matrix  # 负号因为我们要最小化成本
+            else:
+                cost_nwd = 0
+
             # Final cost matrix
-            C = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
+            C = (self.cost_bbox * cost_bbox +
+                 self.cost_class * cost_class +
+                 self.cost_giou * cost_giou +
+                 self.cost_nwd * cost_nwd)
             C = C.view(bs, num_queries, -1).cpu()
 
             sizes = [len(v["boxes"]) for v in targets]
@@ -99,4 +115,5 @@ class HungarianMatcher(nn.Module):
 def build_matcher(args):
     return HungarianMatcher(cost_class=args.set_cost_class,
                             cost_bbox=args.set_cost_bbox,
-                            cost_giou=args.set_cost_giou)
+                            cost_giou=args.set_cost_giou,
+                            cost_nwd=getattr(args, 'set_cost_nwd', 0.0))
