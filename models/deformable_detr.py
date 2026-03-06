@@ -166,7 +166,6 @@ class DeformableDETR(nn.Module):
             for l, feat in enumerate(features):
                 src, mask = feat.decompose()
                 srcs.append(self.input_proj[l](src))
-                masks.append(mask)
 
             # 2. 添加 P6（从 C5 下采样后投影）
             srcs.append(self.input_proj[3](features[-1].tensors))
@@ -174,9 +173,11 @@ class DeformableDETR(nn.Module):
             # 3. BiFPN 融合 [P3, P4, P5, P6] → [P3_out, P4_out, P5_out, P6_out]
             srcs = self.bifpn(srcs)
 
-            # 4. 生成 P6 的 mask
-            m = samples.mask
-            masks.append(F.interpolate(m[None].float(), size=srcs[-1].shape[-2:]).to(torch.bool)[0])
+            # 4. 重新生成所有 mask（因为 BiFPN 可能改变了特征尺寸）
+            for src in srcs:
+                m = samples.mask
+                mask = F.interpolate(m[None].float(), size=src.shape[-2:]).to(torch.bool)[0]
+                masks.append(mask)
         else:
             # 原始流程：直接 input_proj（不使用 BiFPN）
             for l, feat in enumerate(features):
