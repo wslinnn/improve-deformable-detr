@@ -154,27 +154,21 @@ class SeparableConvBlock(nn.Module):
 
 class BiFPN(nn.Module):
     """
-    3 层 BiFPN: 处理 P3, P4, P5
+    4 层 BiFPN: 处理 P3, P4, P5, P6
 
-    与官方 EfficientDet BiFPN 逻辑一致，简化为 3 层版本
+    数据流 (对应官方7层架构，P6对应官方P7位置):
+        Top-Down:                         Bottom-Up:
+        P6_in (最高层，不生成td)           P3_td → P3_out
+          ↓ (上采样)                         ↑ (下采样)
+        P5_in + P6_in↑ → P5_td             P4_td + P4_in + P3_out↓ → P4_out
+          ↓ (上采样)                         ↑ (下采样)
+        P4_in + P5_td↑ → P4_td             P5_td + P5_in + P4_out↓ → P5_out
+          ↓ (上采样)                         ↑ (下采样)
+        P3_in + P4_td↑ → P3_td             P6_in + P5_out↓ → P6_out
 
-    数据流:
-        P5_0 ---------> P5_1 ---------> P5_2
-           |             |                ↑
-           |             |                |
-        P4_0 ---------> P4_1 ---------> P4_2
-           |             |                ↑
-           |             |                |
-        P3_0 -----------------------> P3_2
-
-    Top-Down:
-        P4_1 = P4_0 + P5_0↑
-        P3_2 = P3_0 + P4_1↑
-        (P5_1 无上层，所以 P5_1 = P5_0)
-
-    Bottom-Up:
-        P4_2 = P4_0 + P4_1 + P3_2↓
-        P5_2 = P5_0 + P5_1 + P4_2↓
+    注意: P6 是最高层（对应官方的P7）
+          - Top-Down: P6_in 不生成中间层，直接上采样给P5使用
+          - Bottom-Up: P6_out 只用 2 个输入 (P6_in + P5_out↓)，与官方P7一致
     """
 
     def __init__(self, num_channels=256, epsilon=1e-4, onnx_export=False, attention=True):
@@ -190,18 +184,17 @@ class BiFPN(nn.Module):
         self.onnx_export = onnx_export
         self.attention = attention
 
-        # ========== Top-Down 卷积层 ==========
-        self.conv5up = SeparableConvBlock(num_channels, onnx_export=onnx_export)   # P5→P4
-        self.conv4up = SeparableConvBlock(num_channels, onnx_export=onnx_export)   # P4→P3
-        self.conv3up = SeparableConvBlock(num_channels, onnx_export=onnx_export)   # P3 输出
+        # ========== Top-Down 卷积层 (用于生成中间层 _td) ==========
+        # 注意：最高层P6不生成中间层，直接用于上采样
+        self.conv5up = SeparableConvBlock(num_channels, onnx_export=onnx_export)   # P5_td
+        self.conv4up = SeparableConvBlock(num_channels, onnx_export=onnx_export)   # P4_td
+        self.conv3up = SeparableConvBlock(num_channels, onnx_export=onnx_export)   # P3_td
 
-        # ========== Bottom-Up 卷积层 ==========
-        self.conv4down = SeparableConvBlock(num_channels, onnx_export=onnx_export)  # P3→P4
-        self.conv5down = SeparableConvBlock(num_channels, onnx_export=onnx_export)  # P4→P5
-
-        # ========== 上采样层 ==========
-        self.p5_upsample = nn.Upsample(scale_factor=2, mode='nearest')
-        self.p4_upsample = nn.Upsample(scale_factor=2, mode='nearest')
+        # ========== Bottom-Up 卷积层 (用于生成输出层 _out，与官方命名一致) ==========
+        self.conv3down = SeparableConvBlock(num_channels, onnx_export=onnx_export)  # P3_out (直接输出，实际不使用)
+        self.conv4down = SeparableConvBlock(num_channels, onnx_export=onnx_export)  # P4_out
+        self.conv5down = SeparableConvBlock(num_channels, onnx_export=onnx_export)  # P5_out
+        self.conv6down = SeparableConvBlock(num_channels, onnx_export=onnx_export)  # P6_out
 
         # ========== 下采样层 ==========
         self.p4_downsample = MaxPool2dStaticSamePadding(3, 2)
@@ -214,6 +207,8 @@ class BiFPN(nn.Module):
             self.swish = Swish()
 
         # ========== 可学习权重 (Top-Down) ==========
+        # P6: 最高层，不生成中间层，直接用于上采样
+        # P5 ← P5 + P6↑
         self.p5_w1 = nn.Parameter(torch.ones(2, dtype=torch.float32), requires_grad=True)
         self.p5_w1_relu = nn.ReLU()
         # P4 ← P4 + P5↑
@@ -224,20 +219,23 @@ class BiFPN(nn.Module):
         self.p3_w1_relu = nn.ReLU()
 
         # ========== 可学习权重 (Bottom-Up) ==========
-        # P4 ← P4 + P4_up + P3↓
+        # P4 ← P4 + P4_td + P3_out↓
         self.p4_w2 = nn.Parameter(torch.ones(3, dtype=torch.float32), requires_grad=True)
         self.p4_w2_relu = nn.ReLU()
-        # P5 ← P5 + P5_up + P4↓
+        # P5 ← P5 + P5_td + P4_out↓
         self.p5_w2 = nn.Parameter(torch.ones(3, dtype=torch.float32), requires_grad=True)
         self.p5_w2_relu = nn.ReLU()
+        # P6 ← P6 + P5_out↓ (最高层，只有2个输入，不使用P6_td)
+        self.p6_w2 = nn.Parameter(torch.ones(2, dtype=torch.float32), requires_grad=True)
+        self.p6_w2_relu = nn.ReLU()
 
     def forward(self, inputs):
         """
         Args:
-            inputs: list of tensors [p3_in, p4_in, p5_in]
+            inputs: list of tensors [p3_in, p4_in, p5_in, p6_in]
 
         Returns:
-            outs: list of tensors [p3_out, p4_out, p5_out]
+            outs: list of tensors [p3_out, p4_out, p5_out, p6_out]
         """
         if self.attention:
             outs = self._forward_fast_attention(inputs)
@@ -246,83 +244,101 @@ class BiFPN(nn.Module):
         return outs
 
     def _forward_fast_attention(self, inputs):
-        """快速注意力模式"""
-        p3_in, p4_in, p5_in = inputs
+        """4 层 BiFPN 快速注意力模式"""
+        p3_in, p4_in, p5_in, p6_in = inputs
 
         # ========== Top-Down ==========
 
-        # P5_1: 最高层，无上层输入，P5_1 = P5_0 (经过 conv)
+        # P5_td ← P5_in + P6_in↑ (P6是最高层，不生成中间层，直接用于上采样)
         p5_w1 = self.p5_w1_relu(self.p5_w1)
         weight = p5_w1 / (torch.sum(p5_w1, dim=0) + self.epsilon)
-        p5_up = self.conv5up(self.swish(weight[0] * p5_in))
+        p6_up_interp = F.interpolate(p6_in, size=p5_in.shape[-2:], mode='nearest')
+        p5_td = self.conv5up(self.swish(weight[0] * p5_in + weight[1] * p6_up_interp))
 
-        # P4_1 ← P4_0 + P5_1↑ (动态上采样匹配尺寸)
+        # P4_td ← P4_in + P5_td↑
         p4_w1 = self.p4_w1_relu(self.p4_w1)
         weight = p4_w1 / (torch.sum(p4_w1, dim=0) + self.epsilon)
-        p5_up_interp = F.interpolate(p5_up, size=p4_in.shape[-2:], mode='nearest')
-        p4_up = self.conv4up(self.swish(weight[0] * p4_in + weight[1] * p5_up_interp))
+        p5_up_interp = F.interpolate(p5_td, size=p4_in.shape[-2:], mode='nearest')
+        p4_td = self.conv4up(self.swish(weight[0] * p4_in + weight[1] * p5_up_interp))
 
-        # P3_2 ← P3_0 + P4_1↑ (动态上采样匹配尺寸)
+        # P3_td ← P3_in + P4_td↑
         p3_w1 = self.p3_w1_relu(self.p3_w1)
         weight = p3_w1 / (torch.sum(p3_w1, dim=0) + self.epsilon)
-        p4_up_interp = F.interpolate(p4_up, size=p3_in.shape[-2:], mode='nearest')
-        p3_out = self.conv3up(self.swish(weight[0] * p3_in + weight[1] * p4_up_interp))
+        p4_up_interp = F.interpolate(p4_td, size=p3_in.shape[-2:], mode='nearest')
+        p3_td = self.conv3up(self.swish(weight[0] * p3_in + weight[1] * p4_up_interp))
 
         # ========== Bottom-Up ==========
 
-        # P4_2 ← P4_0 + P4_1 + P3_2↓
+        # P3_out ← P3_td
+        p3_out = p3_td
+
+        # P4_out ← P4_in + P4_td + P3_out↓
         p4_w2 = self.p4_w2_relu(self.p4_w2)
         weight = p4_w2 / (torch.sum(p4_w2, dim=0) + self.epsilon)
+        p4_down = self.p4_downsample(p3_out)
         p4_out = self.conv4down(
-            self.swish(weight[0] * p4_in + weight[1] * p4_up + weight[2] * self.p4_downsample(p3_out))
+            self.swish(weight[0] * p4_in + weight[1] * p4_td + weight[2] * p4_down)
         )
 
-        # P5_2 ← P5_0 + P5_1 + P4_2↓
+        # P5_out ← P5_in + P5_td + P4_out↓
         p5_w2 = self.p5_w2_relu(self.p5_w2)
         weight = p5_w2 / (torch.sum(p5_w2, dim=0) + self.epsilon)
+        p5_down = self.p5_downsample(p4_out)
         p5_out = self.conv5down(
-            self.swish(weight[0] * p5_in + weight[1] * p5_up + weight[2] * self.p5_downsample(p4_out))
+            self.swish(weight[0] * p5_in + weight[1] * p5_td + weight[2] * p5_down)
         )
 
-        return p3_out, p4_out, p5_out
+        # P6_out ← P6_in + P5_out↓ (最高层，只有2个输入，不使用P6_td)
+        p6_w2 = self.p6_w2_relu(self.p6_w2)
+        weight = p6_w2 / (torch.sum(p6_w2, dim=0) + self.epsilon)
+        p6_down = self.p5_downsample(p5_out)
+        p6_out = self.conv6down(
+            self.swish(weight[0] * p6_in + weight[1] * p6_down)
+        )
+
+        return p3_out, p4_out, p5_out, p6_out
 
     def _forward(self, inputs):
-        """标准模式（无权重归一化）"""
-        p3_in, p4_in, p5_in = inputs
+        """4 层 BiFPN 标准模式（无权重归一化）"""
+        p3_in, p4_in, p5_in, p6_in = inputs
 
         # ========== Top-Down ==========
 
-        # P5_1: 最高层
-        p5_up = self.conv5up(self.swish(p5_in))
+        # P5_td ← P5_in + P6_in↑ (P6是最高层，不生成中间层，直接用于上采样)
+        p6_up_interp = F.interpolate(p6_in, size=p5_in.shape[-2:], mode='nearest')
+        p5_td = self.conv5up(self.swish(p5_in + p6_up_interp))
 
-        # P4_1 ← P4_0 + P5_1 (动态上采样匹配尺寸)
-        p5_up_interp = F.interpolate(p5_up, size=p4_in.shape[-2:], mode='nearest')
-        p4_up = self.conv4up(self.swish(p4_in + p5_up_interp))
+        # P4_td ← P4_in + P5_td↑
+        p5_up_interp = F.interpolate(p5_td, size=p4_in.shape[-2:], mode='nearest')
+        p4_td = self.conv4up(self.swish(p4_in + p5_up_interp))
 
-        # P3_2 ← P3_0 + P4_1 (动态上采样匹配尺寸)
-        p4_up_interp = F.interpolate(p4_up, size=p3_in.shape[-2:], mode='nearest')
-        p3_out = self.conv3up(self.swish(p3_in + p4_up_interp))
+        # P3_td ← P3_in + P4_td↑
+        p4_up_interp = F.interpolate(p4_td, size=p3_in.shape[-2:], mode='nearest')
+        p3_td = self.conv3up(self.swish(p3_in + p4_up_interp))
 
-        # ========== Bottom-Up ==========
+        # P3_out
+        p3_out = p3_td
 
-        # P4_2 ← P4_0 + P4_1 + P3_2
-        p4_out = self.conv4down(
-            self.swish(p4_in + p4_up + self.p4_downsample(p3_out))
-        )
+        # P4_out ← P4_in + P4_td + P3_out↓
+        p4_down = self.p4_downsample(p3_out)
+        p4_out = self.conv4down(self.swish(p4_in + p4_td + p4_down))
 
-        # P5_2 ← P5_0 + P5_1 + P4_2
-        p5_out = self.conv5down(
-            self.swish(p5_in + p5_up + self.p5_downsample(p4_out))
-        )
+        # P5_out ← P5_in + P5_td + P4_out↓
+        p5_down = self.p5_downsample(p4_out)
+        p5_out = self.conv5down(self.swish(p5_in + p5_td + p5_down))
 
-        return p3_out, p4_out, p5_out
+        # P6_out ← P6_in + P5_out↓ (最高层，只有2个输入，不使用P6_td)
+        p6_down = self.p5_downsample(p5_out)
+        p6_out = self.conv6down(self.swish(p6_in + p6_down))
+
+        return p3_out, p4_out, p5_out, p6_out
 
 
 class BiFPNUnified(nn.Module):
     """
-    统一通道数的 BiFPN
+    统一通道数的 BiFPN (4 层版本)
 
-    处理 backbone 输出 [C3, C4, C5]，投影后送入 BiFPN
+    处理 backbone 输出 [C3, C4, C5]，先从 C5 生成 C6，然后投影并送入 BiFPN
     """
 
     def __init__(self, backbone_channels=[512, 1024, 2048], unify_channels=256,
@@ -340,17 +356,18 @@ class BiFPNUnified(nn.Module):
         self.backbone_channels = backbone_channels
         self.unify_channels = unify_channels
 
-        # 输入投影层：将 C3, C4, C5 投影到统一维度
+        # 输入投影层：将 C3, C4, C5, C6 投影到统一维度
+        # C6 的通道数与 C5 相同 (都是 2048)
         self.input_projs = nn.ModuleList([
             nn.Sequential(
                 nn.Conv2d(in_ch, unify_channels, kernel_size=1, bias=False),
                 nn.BatchNorm2d(unify_channels, momentum=0.01, eps=1e-3),
                 nn.SiLU()
             )
-            for in_ch in backbone_channels
+            for in_ch in backbone_channels + [backbone_channels[-1]]  # [512, 1024, 2048, 2048]
         ])
 
-        # BiFPN 核心 (3 层)
+        # BiFPN 核心 (4 层)
         self.bifpn = BiFPN(
             num_channels=unify_channels,
             epsilon=epsilon,
@@ -365,16 +382,21 @@ class BiFPNUnified(nn.Module):
             masks: list of tensors (未使用)
 
         Returns:
-            enhanced_features: list of tensors [P3, P4, P5]
+            enhanced_features: list of tensors [P3, P4, P5, P6]
         """
-        # 投影到统一维度
-        unified_features = []
-        for i, feat in enumerate(features):
-            unified = self.input_projs[i](feat)
-            unified_features.append(unified)
+        c3, c4, c5 = features[0].tensors, features[1].tensors, features[2].tensors
 
-        # BiFPN 融合 (3 层)
-        enhanced_features = self.bifpn(unified_features)
+        # 1. 从 C5 生成 C6 (在投影之前，与 Deformable DETR 官方一致)
+        c6 = F.max_pool2d(c5, kernel_size=3, stride=2, padding=1)
+
+        # 2. 投影到统一维度 [C3, C4, C5, C6] → [P3, P4, P5, P6]
+        p3 = self.input_projs[0](c3)
+        p4 = self.input_projs[1](c4)
+        p5 = self.input_projs[2](c5)
+        p6 = self.input_projs[3](c6)
+
+        # 3. BiFPN 融合 (4 层输入 [P3, P4, P5, P6])
+        enhanced_features = self.bifpn([p3, p4, p5, p6])
 
         return enhanced_features
 
@@ -388,6 +410,6 @@ def build_bifpn(channels, hidden_dim=256):
         hidden_dim: Transformer 的隐藏维度
 
     Returns:
-        BiFPN 模块 (3 层版本)
+        BiFPN 模块 (4 层版本: P3, P4, P5, P6)
     """
     return BiFPNUnified(backbone_channels=channels, unify_channels=hidden_dim)

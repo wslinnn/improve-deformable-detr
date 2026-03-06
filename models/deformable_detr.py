@@ -162,7 +162,7 @@ class DeformableDETR(nn.Module):
         masks = []
 
         if self.use_bifpn and self.num_feature_levels > 1:
-            # 使用 BiFPN 增强多尺度特征 (3 层: P3, P4, P5)
+            # 使用 BiFPN 增强多尺度特征 (4 层: P3, P4, P5, P6)
             # 1. 提取所有特征层的 tensors
             feat_tensors = []
 
@@ -171,17 +171,20 @@ class DeformableDETR(nn.Module):
                 feat_tensors.append(src)
 
             # 2. 使用 BiFPN 进行双向跨尺度融合
-            # BiFPNUnified 会先将特征投影到 hidden_dim，然后进行融合
+            # BiFPNUnified 会先将特征投影到 hidden_dim，然后进行 4 层融合
             # 输出已经是 hidden_dim 维度，不需要再经过 input_proj!
             enhanced_tensors = self.bifpn(feat_tensors)
 
-            # 3. 对 BiFPN 输出进行 normalization (保持与原始设计一致)
+            # 3. 对 BiFPN 输出进行 normalization
             for l, enhanced_feat in enumerate(enhanced_tensors):
-                # BiFPN 输出已经经过 BatchNorm，但为了与原始 design 一致，
-                # 这里添加一个简单的 LayerNorm
-                # 或者直接使用，因为 BatchNorm 已经提供了 normalization
                 src = enhanced_feat
-                mask = features[l].mask  # 使用原始 mask
+                # mask 处理：前 3 层使用原始 mask，第 4 层需要生成
+                if l < len(features):
+                    mask = features[l].mask
+                else:
+                    # P6 的 mask 需要下采样生成
+                    m = samples.mask
+                    mask = F.interpolate(m[None].float(), size=src.shape[-2:]).to(torch.bool)[0]
                 srcs.append(src)
                 masks.append(mask)
         else:
@@ -192,20 +195,14 @@ class DeformableDETR(nn.Module):
                 masks.append(mask)
                 assert mask is not None
 
-        # ========== 处理额外的特征层（如 P6，通过下采样 P5 生成）==========
+        # ========== 处理额外的特征层（超过 BiFPN 输出层数时）==========
+        # BiFPN 已输出 4 层 [P3, P4, P5, P6]
+        # 如果 num_feature_levels > 4，需要继续下采样生成更多层级
         if self.num_feature_levels > len(srcs):
             _len_srcs = len(srcs)
             for l in range(_len_srcs, self.num_feature_levels):
-                if self.use_bifpn and self.num_feature_levels > 1:
-                    # BiFPN 模式：srcs[-1] 已经是 hidden_dim 维度
-                    # 直接下采样生成额外层级，不需要再经过 input_proj
-                    src = F.max_pool2d(srcs[-1], kernel_size=3, stride=2, padding=1)
-                else:
-                    # 原始模式：使用 input_proj 生成额外层级
-                    if l == _len_srcs:
-                        src = self.input_proj[l](features[-1].tensors)
-                    else:
-                        src = self.input_proj[l](srcs[-1])
+                # 直接下采样生成额外层级
+                src = F.max_pool2d(srcs[-1], kernel_size=3, stride=2, padding=1)
                 m = samples.mask
                 mask = F.interpolate(m[None].float(), size=src.shape[-2:]).to(torch.bool)[0]
                 pos_l = self.backbone[1](NestedTensor(src, mask)).to(src.dtype)
@@ -345,9 +342,10 @@ class SetCriterion(nn.Module):
         # NWD (Normalized Wasserstein Distance) 对小目标友好
         # 即使框不重叠，NWD 也能提供平滑的梯度
         # 使用 NWD 作为 GIoU 的补充
-        # 使用优化后的 nwd_loss 函数 (O(N) 复杂度)
-        loss_nwd = box_ops.nwd_loss(src_boxes, target_boxes)
-        losses['loss_nwd'] = loss_nwd
+        # 仅当权重 > 0 时才计算（节省计算）
+        if self.weight_dict.get('loss_nwd', 0) > 0:
+            loss_nwd = box_ops.nwd_loss(src_boxes, target_boxes)
+            losses['loss_nwd'] = loss_nwd
 
         return losses
 

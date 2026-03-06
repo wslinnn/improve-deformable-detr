@@ -100,7 +100,7 @@ def get_args_parser():
                         help="L1 box coefficient in the matching cost")
     parser.add_argument('--set_cost_giou', default=2, type=float,
                         help="giou box coefficient in the matching cost")
-    parser.add_argument('--set_cost_nwd', default=2, type=float,
+    parser.add_argument('--set_cost_nwd', default=0, type=float,  # 关闭 NWD matching cost
                         help="NWD box coefficient in the matching cost (set to 0 to disable)")
 
     # * Loss coefficients
@@ -109,7 +109,7 @@ def get_args_parser():
     parser.add_argument('--cls_loss_coef', default=2, type=float)
     parser.add_argument('--bbox_loss_coef', default=5, type=float)
     parser.add_argument('--giou_loss_coef', default=2, type=float)
-    parser.add_argument('--nwd_loss_coef', default=10, type=float,  # 增加权重以平衡 NWD loss 较小的问题
+    parser.add_argument('--nwd_loss_coef', default=0, type=float,
                        help='weight of NWD loss for small object detection (set to 0 to disable)')
     parser.add_argument('--focal_alpha', default=0.25, type=float)
 
