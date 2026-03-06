@@ -160,6 +160,7 @@ class DeformableDETR(nn.Module):
         # ========== BiFPN: 先投影，再进行跨尺度特征融合 ==========
         srcs = []
         masks = []
+        pos = []
 
         if self.use_bifpn and self.num_feature_levels > 1:
             # 1. 投影 backbone 输出 [C3, C4, C5] → [P3, P4, P5]
@@ -173,17 +174,21 @@ class DeformableDETR(nn.Module):
             # 3. BiFPN 融合 [P3, P4, P5, P6] → [P3_out, P4_out, P5_out, P6_out]
             srcs = self.bifpn(srcs)
 
-            # 4. 重新生成所有 mask（因为 BiFPN 可能改变了特征尺寸）
+            # 4. 重新生成所有 mask 和 pos（因为 BiFPN 可能改变了特征尺寸）
             for src in srcs:
                 m = samples.mask
                 mask = F.interpolate(m[None].float(), size=src.shape[-2:]).to(torch.bool)[0]
                 masks.append(mask)
+                # 为每层特征重新生成位置编码
+                pos_l = self.backbone[1](NestedTensor(src, mask)).to(src.dtype)
+                pos.append(pos_l)
         else:
             # 原始流程：直接 input_proj（不使用 BiFPN）
             for l, feat in enumerate(features):
                 src, mask = feat.decompose()
                 srcs.append(self.input_proj[l](src))
                 masks.append(mask)
+            # pos 是从 backbone 获取的，不需要重新生成
 
         # ========== 处理额外的特征层（超过 BiFPN 输出层数时）==========
         # BiFPN 已输出 4 层 [P3, P4, P5, P6]
