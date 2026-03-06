@@ -92,7 +92,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
 
 @torch.no_grad()
-def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, output_dir):
+def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, output_dir, args=None):
     model.eval()
     criterion.eval()
 
@@ -117,7 +117,9 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
         # 模型现在始终返回 (outputs, mask_dict)
-        outputs, mask_dict = model(samples)
+        # 评估时传递 num_patterns 用于 pattern embeddings
+        dn_args = args.num_patterns if args is not None else 0
+        outputs, mask_dict = model(samples, dn_args=dn_args)
         loss_dict = criterion(outputs, targets, mask_dict=mask_dict)
         weight_dict = criterion.weight_dict
 
