@@ -123,7 +123,12 @@ class DeformableTransformer(nn.Module):
         valid_ratio = torch.stack([valid_ratio_w, valid_ratio_h], -1)
         return valid_ratio
 
-    def forward(self, srcs, masks, pos_embeds, query_embed=None):
+    def forward(self, srcs, masks, pos_embeds, query_embed=None, attn_mask=None):
+        """
+        Args:
+            attn_mask: attention mask for decoder self-attention (bs*num_queries, bs*num_queries)
+                      Used for DN training to prevent DN queries from seeing each other
+        """
         assert self.two_stage or query_embed is not None
 
         # prepare input for encoder
@@ -170,15 +175,20 @@ class DeformableTransformer(nn.Module):
             pos_trans_out = self.pos_trans_norm(self.pos_trans(self.get_proposal_pos_embed(topk_coords_unact)))
             query_embed, tgt = torch.split(pos_trans_out, c, dim=2)
         else:
-            query_embed, tgt = torch.split(query_embed, c, dim=1)
-            query_embed = query_embed.unsqueeze(0).expand(bs, -1, -1)
-            tgt = tgt.unsqueeze(0).expand(bs, -1, -1)
+            # Handle both normal mode (no batch dim) and DN mode (with batch dim)
+            if query_embed.dim() == 2:  # Normal mode: [num_queries, hidden_dim*2]
+                query_embed, tgt = torch.split(query_embed, c, dim=1)
+                query_embed = query_embed.unsqueeze(0).expand(bs, -1, -1)
+                tgt = tgt.unsqueeze(0).expand(bs, -1, -1)
+            else:  # DN mode: [bs, num_total_queries, hidden_dim*2]
+                query_embed, tgt = torch.split(query_embed, c, dim=2)
+                tgt = tgt  # Already has batch dim
             reference_points = self.reference_points(query_embed).sigmoid()
             init_reference_out = reference_points
 
         # decoder
         hs, inter_references = self.decoder(tgt, reference_points, memory,
-                                            spatial_shapes, level_start_index, valid_ratios, query_embed, mask_flatten)
+                                            spatial_shapes, level_start_index, valid_ratios, query_embed, mask_flatten, attn_mask=attn_mask)
 
         inter_references_out = inter_references
         if self.two_stage:
@@ -292,10 +302,10 @@ class DeformableTransformerDecoderLayer(nn.Module):
         tgt = self.norm3(tgt)
         return tgt
 
-    def forward(self, tgt, query_pos, reference_points, src, src_spatial_shapes, level_start_index, src_padding_mask=None):
+    def forward(self, tgt, query_pos, reference_points, src, src_spatial_shapes, level_start_index, src_padding_mask=None, attn_mask=None):
         # self attention
         q = k = self.with_pos_embed(tgt, query_pos)
-        tgt2 = self.self_attn(q.transpose(0, 1), k.transpose(0, 1), tgt.transpose(0, 1))[0].transpose(0, 1)
+        tgt2 = self.self_attn(q.transpose(0, 1), k.transpose(0, 1), tgt.transpose(0, 1), attn_mask=attn_mask)[0].transpose(0, 1)
         tgt = tgt + self.dropout2(tgt2)
         tgt = self.norm2(tgt)
 
@@ -323,7 +333,7 @@ class DeformableTransformerDecoder(nn.Module):
         self.class_embed = None
 
     def forward(self, tgt, reference_points, src, src_spatial_shapes, src_level_start_index, src_valid_ratios,
-                query_pos=None, src_padding_mask=None):
+                query_pos=None, src_padding_mask=None, attn_mask=None):
         output = tgt
 
         intermediate = []
@@ -335,7 +345,7 @@ class DeformableTransformerDecoder(nn.Module):
             else:
                 assert reference_points.shape[-1] == 2
                 reference_points_input = reference_points[:, :, None] * src_valid_ratios[:, None]
-            output = layer(output, query_pos, reference_points_input, src, src_spatial_shapes, src_level_start_index, src_padding_mask)
+            output = layer(output, query_pos, reference_points_input, src, src_spatial_shapes, src_level_start_index, src_padding_mask, attn_mask=attn_mask)
 
             # hack implementation for iterative bounding box refinement
             if self.bbox_embed is not None:

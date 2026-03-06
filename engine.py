@@ -24,7 +24,7 @@ from datasets.data_prefetcher import data_prefetcher
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, max_norm: float = 0):
+                    device: torch.device, epoch: int, max_norm: float = 0, args=None):
     model.train()
     criterion.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -39,8 +39,20 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
     # for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
     for _ in metric_logger.log_every(range(len(data_loader)), print_freq, header):
-        outputs = model(samples)
-        loss_dict = criterion(outputs, targets)
+        # Prepare DN args if using denoising training (与官方DN-DETR保持一致)
+        dn_args = None
+        mask_dict = None
+        need_tgt_for_training = False
+        if args is not None and getattr(args, 'use_dn', False):
+            need_tgt_for_training = True
+            dn_args = (targets, args.scalar, args.label_noise_scale, args.box_noise_scale, args.num_patterns)
+
+        if need_tgt_for_training:
+            outputs, mask_dict = model(samples, dn_args=dn_args)
+        else:
+            outputs, mask_dict = model(samples)
+
+        loss_dict = criterion(outputs, targets, mask_dict=mask_dict)
         weight_dict = criterion.weight_dict
         losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
 
@@ -104,8 +116,9 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
         samples = samples.to(device)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
-        outputs = model(samples)
-        loss_dict = criterion(outputs, targets)
+        # 模型现在始终返回 (outputs, mask_dict)
+        outputs, mask_dict = model(samples)
+        loss_dict = criterion(outputs, targets, mask_dict=mask_dict)
         weight_dict = criterion.weight_dict
 
         # reduce losses over all GPUs for logging purposes

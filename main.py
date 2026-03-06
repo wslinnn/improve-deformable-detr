@@ -126,6 +126,13 @@ def get_args_parser():
     parser.add_argument('--num_workers', default=2, type=int)
     parser.add_argument('--cache_mode', default=True, action='store_true', help='whether to cache images on memory')
 
+    # DN (Denoising) training parameters (与官方DN-DETR保持一致)
+    parser.add_argument('--use_dn', action='store_true', help='use denoising training')
+    parser.add_argument('--scalar', default=5, type=int, help='number of dn groups')
+    parser.add_argument('--label_noise_scale', default=0.2, type=float, help='label noise ratio to flip')
+    parser.add_argument('--box_noise_scale', default=0.4, type=float, help='box noise scale to shift and scale')
+    parser.add_argument('--num_patterns', default=0, type=int, help='number of pattern embeddings')
+
     return parser
 
 
@@ -282,7 +289,7 @@ def main(args):
         if args.distributed:
             sampler_train.set_epoch(epoch)
         train_stats = train_one_epoch(
-            model, criterion, data_loader_train, optimizer, device, epoch, args.clip_max_norm)
+            model, criterion, data_loader_train, optimizer, device, epoch, args.clip_max_norm, args=args)
         lr_scheduler.step()
         if args.output_dir:
             checkpoint_paths = [output_dir / 'checkpoint.pth']

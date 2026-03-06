@@ -27,6 +27,9 @@ from .segmentation import (DETRsegm, PostProcessPanoptic, PostProcessSegm,
 from .deformable_transformer import build_deforamble_transformer
 import copy
 
+# DN components for denoising training
+from util.dn_components import (prepare_for_dn, dn_post_process, compute_dn_loss)
+
 
 def _get_clones(module, N):
     return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
@@ -51,9 +54,16 @@ class DeformableDETR(nn.Module):
         self.num_queries = num_queries
         self.transformer = transformer
         hidden_dim = transformer.d_model
+        self.num_classes = num_classes
+
         self.class_embed = nn.Linear(hidden_dim, num_classes)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
         self.num_feature_levels = num_feature_levels
+
+        # DN label encoder (与官方DN-DETR保持一致)
+        # 大小为 hidden_dim - 1，保留1维给indicator
+        self.label_enc = nn.Embedding(num_classes + 1, hidden_dim - 1)
+
         if not two_stage:
             self.query_embed = nn.Embedding(num_queries, hidden_dim*2)
         if num_feature_levels > 1:
@@ -111,7 +121,7 @@ class DeformableDETR(nn.Module):
             for box_embed in self.bbox_embed:
                 nn.init.constant_(box_embed.layers[-1].bias.data[2:], 0.0)
 
-    def forward(self, samples: NestedTensor):
+    def forward(self, samples: NestedTensor, dn_args=None):
         """ The forward expects a NestedTensor, which consists of:
                - samples.tensor: batched images, of shape [batch_size x 3 x H x W]
                - samples.mask: a binary mask of shape [batch_size x H x W], containing 1 on padded pixels
@@ -129,6 +139,10 @@ class DeformableDETR(nn.Module):
         if not isinstance(samples, NestedTensor):
             samples = nested_tensor_from_tensor_list(samples)
         features, pos = self.backbone(samples)
+
+        # Get batch size and device for DN
+        batch_size = samples.tensors.shape[0]
+        device = samples.tensors.device
 
         srcs = []
         masks = []
@@ -151,10 +165,28 @@ class DeformableDETR(nn.Module):
                 masks.append(mask)
                 pos.append(pos_l)
 
-        query_embeds = None
-        if not self.two_stage:
-            query_embeds = self.query_embed.weight
-        hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact = self.transformer(srcs, masks, pos, query_embeds)
+        # Prepare query embeddings with DN support (与官方DN-DETR流程完全一致)
+        # 标准Deformable DETR: query_embed是 [num_queries, hidden_dim*2]
+        # 分离为content部分（前hidden_dim-1维）和position部分（后hidden_dim维）
+        tgt_weight = self.query_embed.weight  # [num_queries, hidden_dim*2]
+        tgt_content = tgt_weight[:, :self.transformer.d_model]  # [num_queries, hidden_dim] - content
+
+        # 对于DN，我们需要将content部分分离为实际content（hidden_dim-1）和indicator（1维）
+        # 在prepare_for_dn中会处理这个分离
+
+        # position部分（用于生成reference points）
+        refpoint_emb = tgt_weight[:, self.transformer.d_model:]  # [num_queries, hidden_dim] - position
+
+        # DN模式: 准备去噪queries (与官方DN-DETR一致)
+        input_query_label, input_query_bbox, attn_mask, mask_dict = \
+            prepare_for_dn(dn_args, tgt_content, refpoint_emb, batch_size, self.training,
+                          self.num_queries, self.num_classes, self.transformer.d_model,
+                          self.label_enc, device)
+
+        # 拼接label和bbox (与官方DN-DETR一致)
+        query_embeds = torch.cat((input_query_label, input_query_bbox), dim=2)
+
+        hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact = self.transformer(srcs, masks, pos, query_embeds, attn_mask=attn_mask)
 
         outputs_classes = []
         outputs_coords = []
@@ -177,6 +209,10 @@ class DeformableDETR(nn.Module):
         outputs_class = torch.stack(outputs_classes)
         outputs_coord = torch.stack(outputs_coords)
 
+        # DN post-processing: separate DN outputs from normal outputs
+        if mask_dict is not None:
+            outputs_class, outputs_coord = dn_post_process(outputs_class, outputs_coord, mask_dict)
+
         out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
@@ -184,7 +220,9 @@ class DeformableDETR(nn.Module):
         if self.two_stage:
             enc_outputs_coord = enc_outputs_coord_unact.sigmoid()
             out['enc_outputs'] = {'pred_logits': enc_outputs_class, 'pred_boxes': enc_outputs_coord}
-        return out
+
+        # 始终返回 (out, mask_dict) 格式，与官方DN-DETR保持一致
+        return out, mask_dict
 
     @torch.jit.unused
     def _set_aux_loss(self, outputs_class, outputs_coord):
@@ -339,12 +377,13 @@ class SetCriterion(nn.Module):
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
 
-    def forward(self, outputs, targets):
+    def forward(self, outputs, targets, mask_dict=None):
         """ This performs the loss computation.
         Parameters:
              outputs: dict of tensors, see the output specification of the model for the format
              targets: list of dicts, such that len(targets) == batch_size.
                       The expected keys in each dict depends on the losses applied, see each loss' doc
+             mask_dict: dict containing DN information for denoising loss computation
         """
         outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs' and k != 'enc_outputs'}
 
@@ -397,6 +436,14 @@ class SetCriterion(nn.Module):
                 l_dict = self.get_loss(loss, enc_outputs, bin_targets, indices, num_boxes, **kwargs)
                 l_dict = {k + f'_enc': v for k, v in l_dict.items()}
                 losses.update(l_dict)
+
+        # Compute DN losses (与官方DN-DETR保持一致)
+        # 总是调用compute_dn_loss，函数内部会处理mask_dict为None的情况
+        aux_num = 0
+        if 'aux_outputs' in outputs:
+            aux_num = len(outputs['aux_outputs'])
+        dn_losses = compute_dn_loss(mask_dict, self.training, aux_num, self.focal_alpha)
+        losses.update(dn_losses)
 
         return losses
 
@@ -481,6 +528,11 @@ def build(args):
     matcher = build_matcher(args)
     weight_dict = {'loss_ce': args.cls_loss_coef, 'loss_bbox': args.bbox_loss_coef}
     weight_dict['loss_giou'] = args.giou_loss_coef
+    # DN loss (与官方DN-DETR保持一致)
+    if args.use_dn:
+        weight_dict['tgt_loss_ce'] = args.cls_loss_coef
+        weight_dict['tgt_loss_bbox'] = args.bbox_loss_coef
+        weight_dict['tgt_loss_giou'] = args.giou_loss_coef
     if args.masks:
         weight_dict["loss_mask"] = args.mask_loss_coef
         weight_dict["loss_dice"] = args.dice_loss_coef
