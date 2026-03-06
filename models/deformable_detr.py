@@ -157,43 +157,32 @@ class DeformableDETR(nn.Module):
         #     masks.append(mask)
         #     assert mask is not None
 
-        # ========== BiFPN: 先进行跨尺度特征融合，再 input_proj ==========
+        # ========== BiFPN: 先投影，再进行跨尺度特征融合 ==========
         srcs = []
         masks = []
 
         if self.use_bifpn and self.num_feature_levels > 1:
-            # 使用 BiFPN 增强多尺度特征 (4 层: P3, P4, P5, P6)
-            # 1. 提取所有特征层的 tensors
-            feat_tensors = []
-
-            for feat in features:
-                src, _ = feat.decompose()
-                feat_tensors.append(src)
-
-            # 2. 使用 BiFPN 进行双向跨尺度融合
-            # BiFPNUnified 会先将特征投影到 hidden_dim，然后进行 4 层融合
-            # 输出已经是 hidden_dim 维度，不需要再经过 input_proj!
-            enhanced_tensors = self.bifpn(feat_tensors)
-
-            # 3. 对 BiFPN 输出进行 normalization
-            for l, enhanced_feat in enumerate(enhanced_tensors):
-                src = enhanced_feat
-                # mask 处理：前 3 层使用原始 mask，第 4 层需要生成
-                if l < len(features):
-                    mask = features[l].mask
-                else:
-                    # P6 的 mask 需要下采样生成
-                    m = samples.mask
-                    mask = F.interpolate(m[None].float(), size=src.shape[-2:]).to(torch.bool)[0]
-                srcs.append(src)
+            # 1. 投影 backbone 输出 [C3, C4, C5] → [P3, P4, P5]
+            for l, feat in enumerate(features):
+                src, mask = feat.decompose()
+                srcs.append(self.input_proj[l](src))
                 masks.append(mask)
+
+            # 2. 添加 P6（从 C5 下采样后投影）
+            srcs.append(self.input_proj[3](features[-1].tensors))
+
+            # 3. BiFPN 融合 [P3, P4, P5, P6] → [P3_out, P4_out, P5_out, P6_out]
+            srcs = self.bifpn(srcs)
+
+            # 4. 生成 P6 的 mask
+            m = samples.mask
+            masks.append(F.interpolate(m[None].float(), size=srcs[-1].shape[-2:]).to(torch.bool)[0])
         else:
             # 原始流程：直接 input_proj（不使用 BiFPN）
             for l, feat in enumerate(features):
                 src, mask = feat.decompose()
                 srcs.append(self.input_proj[l](src))
                 masks.append(mask)
-                assert mask is not None
 
         # ========== 处理额外的特征层（超过 BiFPN 输出层数时）==========
         # BiFPN 已输出 4 层 [P3, P4, P5, P6]

@@ -378,13 +378,19 @@ class BiFPNUnified(nn.Module):
     def forward(self, features, masks=None):
         """
         Args:
-            features: list of tensors [C3, C4, C5] from backbone
+            features: list of NestedTensor or Tensor [C3, C4, C5] from backbone
             masks: list of tensors (未使用)
 
         Returns:
             enhanced_features: list of tensors [P3, P4, P5, P6]
         """
-        c3, c4, c5 = features[0].tensors, features[1].tensors, features[2].tensors
+        # 兼容 NestedTensor 和 Tensor 输入
+        if len(features) > 0 and hasattr(features[0], 'tensors'):
+            # NestedTensor 输入
+            c3, c4, c5 = features[0].tensors, features[1].tensors, features[2].tensors
+        else:
+            # Tensor 输入
+            c3, c4, c5 = features[0], features[1], features[2]
 
         # 1. 从 C5 生成 C6 (在投影之前，与 Deformable DETR 官方一致)
         c6 = F.max_pool2d(c5, kernel_size=3, stride=2, padding=1)
@@ -406,10 +412,10 @@ def build_bifpn(channels, hidden_dim=256):
     构建 BiFPN 模块
 
     Args:
-        channels: backbone 输出的通道数 [C3, C4, C5]
+        channels: backbone 输出的通道数 [C3, C4, C5] (未使用)
         hidden_dim: Transformer 的隐藏维度
 
     Returns:
         BiFPN 模块 (4 层版本: P3, P4, P5, P6)
     """
-    return BiFPNUnified(backbone_channels=channels, unify_channels=hidden_dim)
+    return BiFPN(num_channels=hidden_dim)
