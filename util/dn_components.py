@@ -113,7 +113,7 @@ def prepare_for_cdn(dn_args, training, num_queries, num_classes, hidden_dim, lab
         unmask_bbox = unmask_label = torch.cat(known)
         labels = torch.cat([t['labels'].to(device) for t in targets])
         boxes = torch.cat([t['boxes'].to(device) for t in targets])
-        batch_idx = torch.cat([torch.full_like(t['labels'].long(), i) for i, t in enumerate(targets)])
+        batch_idx = torch.cat([torch.full_like(t['labels'].long(), i).to(device) for i, t in enumerate(targets)])
 
         known_indice = torch.nonzero(unmask_label + unmask_bbox)
         known_indice = known_indice.view(-1)
