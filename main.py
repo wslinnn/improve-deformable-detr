@@ -64,7 +64,7 @@ def get_args_parser():
     parser.add_argument('--num_feature_levels', default=4, type=int, help='number of feature levels')
 
     # * Transformer
-    parser.add_argument('--enc_layers', default=6, type=int,
+    parser.add_argument('--enc_layers', default=4, type=int,
                         help="Number of encoding layers in the transformer")
     parser.add_argument('--dec_layers', default=6, type=int,
                         help="Number of decoding layers in the transformer")
@@ -113,7 +113,7 @@ def get_args_parser():
     parser.add_argument('--num_classes', default=7, type=int,
                         help='Number of object classes (default: auto-detect from dataset)')
 
-    parser.add_argument('--output_dir', default='/root/autodl-tmp/logs/deformable_detr-100-twostage-2',
+    parser.add_argument('--output_dir', default='/root/autodl-tmp/logs/deformable_detr-100-twostage-DN-DINO',
                         help='path where to save, empty for no saving')
     parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
@@ -126,11 +126,11 @@ def get_args_parser():
     parser.add_argument('--num_workers', default=2, type=int)
     parser.add_argument('--cache_mode', default=True, action='store_true', help='whether to cache images on memory')
 
-    # DN (Denoising) training parameters (与官方DN-DETR保持一致)
-    parser.add_argument('--use_dn', action='store_true', help='use denoising training')
-    parser.add_argument('--scalar', default=5, type=int, help='number of dn groups')
-    parser.add_argument('--label_noise_scale', default=0.2, type=float, help='label noise ratio to flip')
-    parser.add_argument('--box_noise_scale', default=0.4, type=float, help='box noise scale to shift and scale')
+    # DN (Denoising) training parameters
+    parser.add_argument('--use_dn', action='store_true', default=True, help='use denoising training')
+    parser.add_argument('--scalar', default=1, type=int, help='number of dn groups')
+    parser.add_argument('--label_noise_scale', default=0.0, type=float, help='label noise ratio to flip')
+    parser.add_argument('--box_noise_scale', default=0.05, type=float, help='box noise scale to shift and scale')
     parser.add_argument('--num_patterns', default=0, type=int, help='number of pattern embeddings')
 
     return parser

@@ -165,28 +165,38 @@ class DeformableDETR(nn.Module):
                 masks.append(mask)
                 pos.append(pos_l)
 
-        # Prepare query embeddings with DN support (与官方DN-DETR流程完全一致)
+        # Prepare query embeddings with DN support (支持两阶段模式)
         # 标准Deformable DETR: query_embed是 [num_queries, hidden_dim*2]
-        # 分离为content部分（前hidden_dim-1维）和position部分（后hidden_dim维）
-        tgt_weight = self.query_embed.weight  # [num_queries, hidden_dim*2]
-        tgt_content = tgt_weight[:, :self.transformer.d_model]  # [num_queries, hidden_dim] - content
+        # 两阶段模式：query_embed由transformer内部生成，DN部分单独处理
 
-        # 对于DN，我们需要将content部分分离为实际content（hidden_dim-1）和indicator（1维）
-        # 在prepare_for_dn中会处理这个分离
+        if self.two_stage:
+            # 两阶段模式：tgt_weight和embedweight为None
+            # DN部分使用padding，query_embed由transformer内部从proposals生成
+            tgt_content = None
+            refpoint_emb = None
+        else:
+            # 非两阶段模式：使用learnable query embeddings
+            tgt_weight = self.query_embed.weight  # [num_queries, hidden_dim*2]
+            tgt_content = tgt_weight[:, :self.transformer.d_model]  # [num_queries, hidden_dim] - content
+            refpoint_emb = tgt_weight[:, self.transformer.d_model:]  # [num_queries, hidden_dim] - position
 
-        # position部分（用于生成reference points）
-        refpoint_emb = tgt_weight[:, self.transformer.d_model:]  # [num_queries, hidden_dim] - position
-
-        # DN模式: 准备去噪queries (与官方DN-DETR一致)
-        input_query_label, input_query_bbox, attn_mask, mask_dict = \
+        # DN模式: 准备去噪queries (支持两阶段)
+        input_query_label, input_query_bbox, attn_mask, mask_dict, dn_bbox_coords = \
             prepare_for_dn(dn_args, tgt_content, refpoint_emb, batch_size, self.training,
                           self.num_queries, self.num_classes, self.transformer.d_model,
                           self.label_enc, device)
 
-        # 拼接label和bbox (与官方DN-DETR一致)
-        query_embeds = torch.cat((input_query_label, input_query_bbox), dim=2)
+        # 拼接label和bbox
+        # 两阶段模式：input_query_label和input_query_bbox可能是padding（不是None）
+        if input_query_label is not None and input_query_bbox is not None:
+            query_embeds = torch.cat((input_query_label, input_query_bbox), dim=2)
+            # query_embeds: [bs, dn_queries + num_queries, hidden_dim*2]
+        else:
+            # 推理模式，没有DN
+            query_embeds = None
 
-        hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact = self.transformer(srcs, masks, pos, query_embeds, attn_mask=attn_mask)
+        hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact = self.transformer(
+            srcs, masks, pos, query_embeds, attn_mask=attn_mask, dn_bbox_coords=dn_bbox_coords)
 
         outputs_classes = []
         outputs_coords = []

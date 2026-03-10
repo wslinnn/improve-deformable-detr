@@ -67,8 +67,8 @@ class DeformableTransformer(nn.Module):
             constant_(self.reference_points.bias.data, 0.)
         normal_(self.level_embed)
 
-    def get_proposal_pos_embed(self, proposals):
-        num_pos_feats = 128
+    def get_proposal_pos_embed(self, proposals, hidden_dim=256):
+        num_pos_feats = hidden_dim // 2
         temperature = 10000
         scale = 2 * math.pi
 
@@ -76,10 +76,11 @@ class DeformableTransformer(nn.Module):
         dim_t = temperature ** (2 * (dim_t // 2) / num_pos_feats)
         # N, L, 4
         proposals = proposals.sigmoid() * scale
-        # N, L, 4, 128
+        # N, L, 4, num_pos_feats
         pos = proposals[:, :, :, None] / dim_t
-        # N, L, 4, 64, 2
+        # N, L, 4, num_pos_feats/2, 2
         pos = torch.stack((pos[:, :, :, 0::2].sin(), pos[:, :, :, 1::2].cos()), dim=4).flatten(2)
+        # N, L, hidden_dim*2
         return pos
 
     def gen_encoder_output_proposals(self, memory, memory_padding_mask, spatial_shapes):
@@ -123,11 +124,13 @@ class DeformableTransformer(nn.Module):
         valid_ratio = torch.stack([valid_ratio_w, valid_ratio_h], -1)
         return valid_ratio
 
-    def forward(self, srcs, masks, pos_embeds, query_embed=None, attn_mask=None):
+    def forward(self, srcs, masks, pos_embeds, query_embed=None, attn_mask=None, dn_bbox_coords=None):
         """
         Args:
             attn_mask: attention mask for decoder self-attention (bs*num_queries, bs*num_queries)
                       Used for DN training to prevent DN queries from seeing each other
+            dn_bbox_coords: [N, 4] 带噪声的bbox坐标 (cxcywh格式，inverse_sigmoid后)
+                           用于两阶段+DN模式的reference_points
         """
         assert self.two_stage or query_embed is not None
 
@@ -170,10 +173,58 @@ class DeformableTransformer(nn.Module):
             topk_proposals = torch.topk(enc_outputs_class[..., 0], topk, dim=1)[1]
             topk_coords_unact = torch.gather(enc_outputs_coord_unact, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, 4))
             topk_coords_unact = topk_coords_unact.detach()
-            reference_points = topk_coords_unact.sigmoid()
+            reference_points_two_stage = topk_coords_unact.sigmoid()
+            # reference_points_two_stage: [bs, num_queries, 4]
+
+            # 从proposals生成两阶段部分的query_embed
+            pos_trans_out = self.pos_trans_norm(self.pos_trans(self.get_proposal_pos_embed(topk_coords_unact, self.d_model)))
+            # pos_trans_out: [bs, num_queries, hidden_dim*2] - 两阶段部分
+
+            # 两阶段 + DN模式：
+            # query_embed来自prepare_for_dn，只有DN部分（padding）
+            # 需要拼接两阶段部分
+            if query_embed is not None and query_embed.shape[1] > 0:
+                # 有DN部分：拼接DN(padding) + 两阶段部分
+                # DN部分在前（padding），两阶段部分在后
+                # query_embed: [bs, dn_queries, hidden_dim*2]
+                # pos_trans_out: [bs, num_queries, hidden_dim*2]
+
+                # 提取DN部分的bbox (前dn_queries个，从input_query_bbox提取)
+                # input_query_bbox 在 prepare_for_dn 中被转换为 hidden_dim 维
+                # 需要从 query_embed 的前半部分提取 bbox
+                dn_queries = query_embed.shape[1]
+
+                # DN reference_points: 使用带噪声的bbox坐标（与DINO一致）
+                # dn_bbox_coords: [N, 4] inverse_sigmoid后的bbox坐标
+                # 需要扩展到batch维度并sigmoid
+                if dn_bbox_coords is not None:
+                    # dn_bbox_coords: [total_dn_queries, 4] - 需要按batch展开
+                    # 提取当前batch的DN bbox坐标
+                    dn_reference_points = dn_bbox_coords.unsqueeze(0).expand(bs, -1, -1)
+                    # 截取当前batch对应的数量
+                    dn_reference_points = dn_reference_points[:, :dn_queries, :]
+                    # 转换为sigmoid空间
+                    dn_reference_points = dn_reference_points.sigmoid()
+                else:
+                    # 备用：使用默认值
+                    dn_reference_points = torch.zeros(bs, dn_queries, 4, device=reference_points_two_stage.device)
+                    dn_reference_points[:, :, 2:] = 0.1
+                    dn_reference_points[:, :, :2] = 0.5
+
+                # 拼接DN和两阶段的reference_points
+                reference_points = torch.cat([dn_reference_points, reference_points_two_stage], dim=1)
+                # reference_points: [bs, dn_queries + num_queries, 4]
+
+                query_embed = torch.cat([query_embed, pos_trans_out], dim=1)
+            else:
+                # 没有DN，直接使用两阶段部分
+                query_embed = pos_trans_out
+                reference_points = reference_points_two_stage
+
             init_reference_out = reference_points
-            pos_trans_out = self.pos_trans_norm(self.pos_trans(self.get_proposal_pos_embed(topk_coords_unact)))
-            query_embed, tgt = torch.split(pos_trans_out, c, dim=2)
+
+            # 分离content和position用于decoder
+            query_embed, tgt = torch.split(query_embed, c, dim=2)
         else:
             # Handle both normal mode (no batch dim) and DN mode (with batch dim)
             if query_embed.dim() == 2:  # Normal mode: [num_queries, hidden_dim*2]
