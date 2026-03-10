@@ -252,6 +252,10 @@ def prepare_for_dn(dn_args, tgt_weight, embedweight, batch_size, training,
         mask_dict: dict containing DN information (兼容现有代码)
     """
     if training:
+        # 如果dn_args为None，返回空值
+        if dn_args is None:
+            return None, None, None, None, None
+
         # 解析dn_args - 支持两种格式
         # 格式1: (targets, scalar, label_noise_scale, box_noise_scale, num_patterns)
         # 格式2: (targets, dn_number, label_noise_scale, box_noise_scale)
