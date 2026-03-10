@@ -53,7 +53,7 @@ def get_args_parser():
                         help="Path to the pretrained model. If set, only the mask head will be trained")
 
     # * Backbone
-    parser.add_argument('--backbone', default='resnet50', type=str,
+    parser.add_argument('--backbone', default='resnet18', type=str,
                         help="Name of the convolutional backbone to use")
     parser.add_argument('--dilation', action='store_true',
                         help="If true, we replace stride with dilation in the last convolutional block (DC5)")
@@ -64,7 +64,7 @@ def get_args_parser():
     parser.add_argument('--num_feature_levels', default=4, type=int, help='number of feature levels')
 
     # * Transformer
-    parser.add_argument('--enc_layers', default=6, type=int,
+    parser.add_argument('--enc_layers', default=4, type=int,
                         help="Number of encoding layers in the transformer")
     parser.add_argument('--dec_layers', default=6, type=int,
                         help="Number of decoding layers in the transformer")
@@ -113,7 +113,7 @@ def get_args_parser():
     parser.add_argument('--num_classes', default=7, type=int,
                         help='Number of object classes (default: auto-detect from dataset)')
 
-    parser.add_argument('--output_dir', default='/root/autodl-tmp/logs/deformable_detr-100-twostage-2',
+    parser.add_argument('--output_dir', default='/root/autodl-tmp/logs/deformable_detr-100-twostage-resnet18-ema',
                         help='path where to save, empty for no saving')
     parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
@@ -125,6 +125,11 @@ def get_args_parser():
     parser.add_argument('--eval', action='store_true')
     parser.add_argument('--num_workers', default=2, type=int)
     parser.add_argument('--cache_mode', default=True, action='store_true', help='whether to cache images on memory')
+
+    # EMA parameters
+    parser.add_argument('--use_ema', action='store_true', default=True, help='use EMA for model weights')
+    parser.add_argument('--ema_decay', default=0.999, type=float, help='EMA decay rate')
+    parser.add_argument('--ema_start_epoch', default=20, type=int, help='Start EMA after N epochs (0 to start from beginning)')
 
     return parser
 
@@ -147,6 +152,10 @@ def main(args):
 
     model, criterion, postprocessors = build_model(args)
     model.to(device)
+
+    # Build EMA early (before checkpoint loading)
+    from util.ema import build_ema
+    ema = build_ema(model, args, device)
 
     model_without_ddp = model
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -240,12 +249,22 @@ def main(args):
                 args.resume, map_location='cpu', check_hash=True)
         else:
             checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
-        missing_keys, unexpected_keys = model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
+        # Skip backbone weights when using different backbone (e.g., R50 -> R18)
+        ckpt_model = checkpoint['model']
+        if args.backbone not in args.resume:
+            print(f"Warning: Loading checkpoint from {args.resume} but using backbone {args.backbone}")
+            print("Skipping backbone weights to avoid dimension mismatch...")
+            ckpt_model = {k: v for k, v in ckpt_model.items() if 'backbone' not in k and 'input_proj' not in k}
+        missing_keys, unexpected_keys = model_without_ddp.load_state_dict(ckpt_model, strict=False)
         unexpected_keys = [k for k in unexpected_keys if not (k.endswith('total_params') or k.endswith('total_ops'))]
         if len(missing_keys) > 0:
             print('Missing Keys: {}'.format(missing_keys))
         if len(unexpected_keys) > 0:
             print('Unexpected Keys: {}'.format(unexpected_keys))
+        # Load EMA state from checkpoint if available
+        if ema is not None and 'ema_state' in checkpoint:
+            print("Loading EMA state from checkpoint...")
+            ema.ema_state.load_state_dict(checkpoint['ema_state'])
         if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
             import copy
             p_groups = copy.deepcopy(optimizer.param_groups)
@@ -265,24 +284,39 @@ def main(args):
             args.start_epoch = checkpoint['epoch'] + 1
         # check the resumed model
         if not args.eval:
+            # Apply EMA weights for evaluation
+            if ema is not None:
+                ema.apply_shadow()
             test_stats, coco_evaluator = evaluate(
                 model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir
             )
-    
+            # Restore original weights after evaluation
+            if ema is not None:
+                ema.restore()
+
     if args.eval:
+        # Apply EMA weights for evaluation
+        if ema is not None:
+            ema.apply_shadow()
         test_stats, coco_evaluator = evaluate(model, criterion, postprocessors,
                                               data_loader_val, base_ds, device, args.output_dir)
+        # Restore original weights after evaluation
+        if ema is not None:
+            ema.restore()
         if args.output_dir:
             utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval, output_dir / "eval.pth")
         return
 
     print("Start training")
     start_time = time.time()
+
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             sampler_train.set_epoch(epoch)
         train_stats = train_one_epoch(
-            model, criterion, data_loader_train, optimizer, device, epoch, args.clip_max_norm)
+            model, criterion, data_loader_train, optimizer, device, epoch, args.clip_max_norm,
+            ema, ema_start_epoch=args.ema_start_epoch)
+
         lr_scheduler.step()
         if args.output_dir:
             checkpoint_paths = [output_dir / 'checkpoint.pth']
@@ -290,17 +324,27 @@ def main(args):
             if (epoch + 1) % args.lr_drop == 0 or (epoch + 1) % 5 == 0:
                 checkpoint_paths.append(output_dir / f'checkpoint{epoch:04}.pth')
             for checkpoint_path in checkpoint_paths:
-                utils.save_on_master({
+                checkpoint = {
                     'model': model_without_ddp.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'lr_scheduler': lr_scheduler.state_dict(),
                     'epoch': epoch,
                     'args': args,
-                }, checkpoint_path)
+                }
+                # Save EMA state
+                if ema is not None:
+                    checkpoint['ema_state'] = ema.shadow
+                utils.save_on_master(checkpoint, checkpoint_path)
 
+        # Apply EMA weights for evaluation
+        if ema is not None:
+            ema.apply_shadow()
         test_stats, coco_evaluator = evaluate(
             model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir
         )
+        # Restore original weights after evaluation
+        if ema is not None:
+            ema.restore()
 
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
                      **{f'test_{k}': v for k, v in test_stats.items()},
