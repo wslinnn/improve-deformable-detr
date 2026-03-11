@@ -306,7 +306,7 @@ def main(args):
 
     # Determine if EMA has started (from checkpoint resume)
     resume_epoch = args.start_epoch if args.start_epoch > 0 else 0
-    ema_started = ema is not None and resume_epoch >= args.ema_start_epoch
+    ema_started = ema is not None and resume_epoch > args.ema_start_epoch
 
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
