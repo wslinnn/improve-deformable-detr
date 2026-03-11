@@ -25,7 +25,7 @@ from datasets.data_prefetcher import data_prefetcher
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, max_norm: float = 0, args=None,
-                    ema=None, ema_start_epoch: int = 0):
+                    ema=None, ema_started=False):
     model.train()
     criterion.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -36,7 +36,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     print_freq = 10
 
     # Check if EMA should be active for this epoch
-    use_ema_this_epoch = ema is not None and epoch >= ema_start_epoch
+    use_ema_this_epoch = ema is not None and ema_started
 
     prefetcher = data_prefetcher(data_loader, device, prefetch=True)
     samples, targets = prefetcher.next()

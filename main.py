@@ -41,7 +41,6 @@ def get_args_parser():
     parser.add_argument('--clip_max_norm', default=0.1, type=float,
                         help='gradient clipping max norm')
 
-
     parser.add_argument('--sgd', action='store_true')
 
     # Variants of Deformable DETR
@@ -113,7 +112,7 @@ def get_args_parser():
     parser.add_argument('--num_classes', default=7, type=int,
                         help='Number of object classes (default: auto-detect from dataset)')
 
-    parser.add_argument('--output_dir', default='/root/autodl-tmp/logs/deformable_detr-100-twostage-DN-DINO-EMA-2',
+    parser.add_argument('--output_dir', default='/root/autodl-tmp/logs/deformable_detr-100-twostage-DN-DINO',
                         help='path where to save, empty for no saving')
     parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
@@ -136,7 +135,7 @@ def get_args_parser():
     # EMA parameters
     parser.add_argument('--use_ema', action='store_true', default=True, help='use EMA for model weights')
     parser.add_argument('--ema_decay', default=0.999, type=float, help='EMA decay rate')
-    parser.add_argument('--ema_start_epoch', default=20, type=int, help='Start EMA after N epochs (0 to start from beginning)')
+    parser.add_argument('--ema_start_epoch', default=20, type=int, help='Start EMA after N epochs')
 
     return parser
 
@@ -160,7 +159,7 @@ def main(args):
     model, criterion, postprocessors = build_model(args)
     model.to(device)
 
-    # Build EMA early (before checkpoint loading)
+    # Build EMA
     from util.ema import build_ema
     ema = build_ema(model, args, device)
 
@@ -249,11 +248,6 @@ def main(args):
         model_without_ddp.detr.load_state_dict(checkpoint['model'])
 
     output_dir = Path(args.output_dir)
-
-    # Track if EMA was loaded from checkpoint and if it should be used
-    ema_loaded_from_checkpoint = False
-    resume_epoch = 0
-
     # if args.resume:
     if args.resume and args.start_epoch != 0:
         if args.resume.startswith('https'):
@@ -261,28 +255,17 @@ def main(args):
                 args.resume, map_location='cpu', check_hash=True)
         else:
             checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
-        # Skip backbone weights when using different backbone (e.g., R50 -> R18)
-        ckpt_model = checkpoint['model']
-        if args.backbone not in args.resume:
-            print(f"Warning: Loading checkpoint from {args.resume} but using backbone {args.backbone}")
-            print("Skipping backbone weights to avoid dimension mismatch...")
-            ckpt_model = {k: v for k, v in ckpt_model.items() if 'backbone' not in k and 'input_proj' not in k}
-        missing_keys, unexpected_keys = model_without_ddp.load_state_dict(ckpt_model, strict=False)
-        unexpected_keys = [k for k in unexpected_keys if
-                           not (k.endswith('total_params') or k.endswith('total_ops'))]
+        missing_keys, unexpected_keys = model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
+        unexpected_keys = [k for k in unexpected_keys if not (k.endswith('total_params') or k.endswith('total_ops'))]
         if len(missing_keys) > 0:
             print('Missing Keys: {}'.format(missing_keys))
         if len(unexpected_keys) > 0:
             print('Unexpected Keys: {}'.format(unexpected_keys))
-        # Load EMA state from checkpoint if available (only if checkpoint epoch >= ema_start_epoch)
+        # Load EMA state if available
         resume_epoch = checkpoint.get('epoch', -1)
-        if ema is not None and 'ema_state' in checkpoint:
-            if resume_epoch >= args.ema_start_epoch:
-                print(f"Loading EMA state from checkpoint (epoch {resume_epoch})...")
-                ema.ema_state.load_state_dict(checkpoint['ema_state'])
-                ema_loaded_from_checkpoint = True
-            else:
-                print(f"Warning: EMA state in checkpoint (epoch {resume_epoch}) but ema_start_epoch={args.ema_start_epoch}, skipping EMA...")
+        if ema is not None and 'ema_state' in checkpoint and resume_epoch >= args.ema_start_epoch:
+            print(f"Loading EMA state from checkpoint (epoch {resume_epoch})...")
+            ema.ema_state.load_state_dict(checkpoint['ema_state'])
         if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
             import copy
             p_groups = copy.deepcopy(optimizer.param_groups)
@@ -302,26 +285,17 @@ def main(args):
             args.start_epoch = checkpoint['epoch'] + 1
         # check the resumed model
         if not args.eval:
-            # Resume后推理：判断checkpoint保存时的epoch是否 >= ema_start_epoch
-            use_ema_for_eval = ema is not None and (args.ema_start_epoch == 0 or resume_epoch >= args.ema_start_epoch)
-            if use_ema_for_eval:
-                ema.apply_shadow()
             test_stats, coco_evaluator = evaluate(
-                model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir
+                model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir, args
             )
-            # Restore original weights after evaluation
-            if use_ema_for_eval:
-                ema.restore()
 
     if args.eval:
-        # 纯推理模式：默认不用EMA，除非设置ema_start_epoch=0
-        use_ema_for_eval = ema is not None and args.ema_start_epoch == 0
-        if use_ema_for_eval:
+        # Use EMA weights for inference if started
+        if ema is not None and args.start_epoch >= args.ema_start_epoch:
             ema.apply_shadow()
         test_stats, coco_evaluator = evaluate(model, criterion, postprocessors,
-                                              data_loader_val, base_ds, device, args.output_dir)
-        # Restore original weights after evaluation
-        if use_ema_for_eval:
+                                              data_loader_val, base_ds, device, args.output_dir, args)
+        if ema is not None and args.start_epoch >= args.ema_start_epoch:
             ema.restore()
         if args.output_dir:
             utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval, output_dir / "eval.pth")
@@ -330,25 +304,24 @@ def main(args):
     print("Start training")
     start_time = time.time()
 
-    # Track if EMA has started (after ema_start_epoch OR if loaded from checkpoint)
-    ema_started = ema_loaded_from_checkpoint
+    # Determine if EMA has started (from checkpoint resume)
+    resume_epoch = args.start_epoch if args.start_epoch > 0 else 0
+    ema_started = ema is not None and resume_epoch >= args.ema_start_epoch
 
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             sampler_train.set_epoch(epoch)
 
-        # Check if EMA should start from this epoch (MUST be BEFORE training)
+        # Start EMA when reaching ema_start_epoch
         if ema is not None and not ema_started and epoch >= args.ema_start_epoch:
             ema_started = True
-            # Re-initialize EMA shadow with current trained model weights
             ema.ema_updater.init_state(model)
-            print(f"EMA started at epoch {epoch}, re-initialized shadow with trained weights")
+            print(f"EMA started at epoch {epoch}")
 
-        # Train this epoch
+        # Train with EMA update
         train_stats = train_one_epoch(
-            model, criterion, data_loader_train, optimizer, device, epoch, args.clip_max_norm, args,
-            ema, ema_start_epoch=args.ema_start_epoch)
-
+            model, criterion, data_loader_train, optimizer, device, epoch, args.clip_max_norm, args=args,
+            ema=ema, ema_started=ema_started)
         lr_scheduler.step()
         if args.output_dir:
             checkpoint_paths = [output_dir / 'checkpoint.pth']
@@ -363,16 +336,16 @@ def main(args):
                     'epoch': epoch,
                     'args': args,
                 }
-                # Save EMA state
-                if ema is not None:
+                # Save EMA state if started
+                if ema is not None and ema_started:
                     checkpoint['ema_state'] = ema.shadow
                 utils.save_on_master(checkpoint, checkpoint_path)
 
-        # Apply EMA weights for evaluation (only after ema_start_epoch)
+        # Use EMA weights for evaluation if started
         if ema is not None and ema_started:
             ema.apply_shadow()
         test_stats, coco_evaluator = evaluate(
-            model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir
+            model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir, args
         )
         # Restore original weights after evaluation
         if ema is not None and ema_started:
